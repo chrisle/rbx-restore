@@ -1,0 +1,39 @@
+[package]
+name = "rbxport-restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Restores RBXport backups of a rekordbox library, in whole or in parts."
+
+[lib]
+name = "rbxport_restore_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+# Whether rekordbox or RBXport is running, in one scan of the process list.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Pinned snapshots of RBXport's archive and database crates live in this
+# workspace so clean CI checkouts build the exact format this release expects.
+rbl-backup = { path = "../crates/rbl-backup" }
+rbl-db = { path = "../crates/rbl-db" }
+rbl-core = { path = "../crates/rbl-core" }
+
+[dev-dependencies]
+tempfile = "3"
+rbl-backup = { path = "../crates/rbl-backup", features = ["testing"] }
+zip = { version = "4.6.1", default-features = false, features = ["deflate"] }

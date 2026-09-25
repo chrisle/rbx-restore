@@ -1,0 +1,56 @@
+[workspace]
+members = [
+  "src-tauri",
+  "crates/rbl-anlz",
+  "crates/rbl-backup",
+  "crates/rbl-core",
+  "crates/rbl-db",
+]
+# The vendored RBXport crates retain their upstream tests and diagnostic
+# examples; this app's default checks exercise the restore package itself.
+default-members = ["src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# The same bar as rbxport, whose crates this app builds on.
+[workspace.lints.clippy]
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+await_holding_lock = "deny"
+needless_pass_by_value = "deny"
+large_enum_variant = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# A panic inside a command is caught and returned as an error.
+panic = "unwind"
+strip = "symbols"
+
+[profile.dev.package."*"]
+# SQLCipher and inflating a backup are unusable in a debug build otherwise.
+opt-level = 2

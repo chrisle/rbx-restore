@@ -1,0 +1,173 @@
+//! What an export needs from the library beyond the index's columns.
+//!
+//! Read straight from the database for the tracks being exported rather than
+//! kept in memory for every track: My Tag memberships and the alternative
+//! paths of a cloud-synced file are looked at once per export, and the index
+//! would carry them for 38,681 rows to answer for 61.
+
+use std::collections::HashMap;
+
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::Result;
+
+/// One row of `djmdMyTag`: a category (`attribute` 1, parent `root`) or a
+/// tag under one (`attribute` 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyTagRow {
+    pub id: String,
+    pub seq: i64,
+    pub name: String,
+    pub attribute: i64,
+    /// The category's id, or `root` for a category.
+    pub parent: String,
+}
+
+/// Whether a table exists, so a library without My Tags still exports.
+fn has_table(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok_and(|n| n > 0)
+}
+
+/// Every live My Tag, categories first in their order, then the tags in
+/// theirs.
+pub fn my_tags(conn: &Connection) -> Result<Vec<MyTagRow>> {
+    if !has_table(conn, "djmdMyTag") {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT ID, Seq, Name, Attribute, ParentID FROM djmdMyTag
+         WHERE rb_local_deleted = 0 ORDER BY Attribute DESC, Seq, ID",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(MyTagRow {
+            id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            seq: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            attribute: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            parent: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(std::result::Result::ok).filter(|t| !t.id.is_empty()).collect())
+}
+
+/// `djmdProperty.DBID`, the library's own id, which a stick's sync record
+/// names so rekordbox knows which library synced it. 0 when the row is
+/// missing or not a number.
+pub fn db_id(conn: &Connection) -> Result<u64> {
+    if !has_table(conn, "djmdProperty") {
+        return Ok(0);
+    }
+    let id: Option<String> = conn
+        .query_row("SELECT DBID FROM djmdProperty LIMIT 1", [], |r| r.get(0))
+        .optional()?
+        .flatten();
+    Ok(id.and_then(|id| id.parse().ok()).unwrap_or(0))
+}
+
+/// What one exported track needs that the index does not hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackExtras {
+    pub metadata: rbl_core::ExportMetadata,
+    pub cues: Vec<rbl_anlz::cues::ExportCue>,
+    /// Other places the file may be, after `FolderPath`: the local copy of a
+    /// cloud-synced track (`rb_LocalFolderPath`) and where it was imported
+    /// from (`OrgFolderPath`). Empty entries are left out.
+    pub alternate_paths: Vec<String>,
+    /// The ids of the My Tags on the track.
+    pub my_tags: Vec<String>,
+}
+
+/// The extras for a set of tracks, keyed by `djmdContent.ID`.
+///
+/// One query per thousand ids, so a whole-library export stays a handful
+/// of statements rather than one per track.
+pub fn track_extras(conn: &Connection, ids: &[String]) -> Result<HashMap<String, TrackExtras>> {
+    let mut out: HashMap<String, TrackExtras> = HashMap::with_capacity(ids.len());
+    let tagged = has_table(conn, "djmdSongMyTag");
+    for chunk in ids.chunks(900) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let params = rusqlite::params_from_iter(chunk.iter());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT ID, rb_LocalFolderPath, OrgFolderPath, TrackNo, DiscNo, BitDepth, DJPlayCount, Analysed, HotCueAutoLoad, DateCreated, ISRC FROM djmdContent WHERE ID IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(params, |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                rbl_core::ExportMetadata {
+                    track_number: r.get::<_, Option<u32>>(3)?.unwrap_or(0),
+                    disc_number: r.get::<_, Option<u16>>(4)?.unwrap_or(0),
+                    bit_depth: r.get::<_, Option<u16>>(5)?.unwrap_or(0),
+                    play_count: r.get::<_, Option<u32>>(6)?.unwrap_or(0),
+                    analysed: r.get::<_, Option<u32>>(7)?.unwrap_or(0),
+                    hot_cue_auto_load: r.get::<_, Option<String>>(8)?.is_some_and(|v| v == "on"),
+                    date_created: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    isrc: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, local, org, metadata) = row?;
+            let extras = out.entry(id).or_default();
+            extras.metadata = metadata;
+            for path in [local, org] {
+                if !path.is_empty() && !extras.alternate_paths.contains(&path) {
+                    extras.alternate_paths.push(path);
+                }
+            }
+        }
+        if has_table(conn, "djmdCue") {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT ContentID, Kind, InMsec, OutMsec, Color, ColorTableIndex, Comment, ActiveLoop, BeatLoopSize
+                 FROM djmdCue WHERE rb_local_deleted=0 AND Kind IN (0,1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17)
+                 AND ContentID IN ({marks}) ORDER BY rowid DESC"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                let kind = r.get::<_, Option<u8>>(1)?.unwrap_or(0);
+                let color = r.get::<_, Option<i64>>(4)?.unwrap_or(255);
+                let end = r.get::<_, Option<i64>>(3)?.unwrap_or(-1);
+                let beats = r.get::<_, Option<u32>>(8)?.unwrap_or(0);
+                Ok((r.get::<_, String>(0)?, rbl_anlz::cues::ExportCue {
+                    kind,
+                    time_ms: r.get::<_, Option<u32>>(2)?.unwrap_or(0),
+                    loop_time_ms: u32::try_from(end).ok(),
+                    color_id: if kind == 0 { u8::try_from(color).ok().filter(|c| *c != 255).unwrap_or(0) } else {0},
+                    color_code: r.get::<_, Option<u8>>(5)?.unwrap_or(0),
+                    comment: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    active_loop: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                    loop_numerator: u16::try_from(beats >> 16).unwrap_or(0),
+                    loop_denominator: u16::try_from(beats & 0xffff).unwrap_or(0),
+                }))
+            })?;
+            for row in rows {
+                let (id, cue) = row?;
+                out.entry(id).or_default().cues.push(cue);
+            }
+        }
+        if tagged {
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let mut stmt = conn.prepare(&format!(
+                "SELECT ContentID, MyTagID FROM djmdSongMyTag
+                 WHERE rb_local_deleted = 0 AND ContentID IN ({marks}) ORDER BY ContentID, MyTagID"
+            ))?;
+            let rows = stmt.query_map(params, |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })?;
+            for (content, tag) in rows.filter_map(std::result::Result::ok) {
+                if !tag.is_empty() {
+                    out.entry(content).or_default().my_tags.push(tag);
+                }
+            }
+        }
+    }
+    Ok(out)
+}

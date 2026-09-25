@@ -1,0 +1,2142 @@
+//! Writer behaviour, against a fixture with the real schema.
+//!
+//! Every test builds its own encrypted library in a tempdir. Nothing here can
+//! reach the installed library: `Library::open` refuses read-write on a real
+//! install whenever `RB_LITE_TEST` is set, and a fixture is never marked as one.
+#![allow(clippy::pedantic, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use rbl_db::fixture::{self, playlist_id, track_id, Shape};
+use rbl_db::write::{
+    AnalysisRegistration, Changed, TrackField, Unsupported, Writer, ANALYSED_FULL, ATTRIBUTE_FOLDER,
+    ATTRIBUTE_PLAYLIST, ROOT,
+};
+use rbl_db::{DbError, Library, OpenMode};
+use rusqlite::params;
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    writer: Writer,
+}
+
+fn fixture_with(shape: Shape) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let location = fixture::build(dir.path(), shape).expect("build the fixture");
+    let writer = Writer::open(location, dir.path().join("backups")).expect("open for writing");
+    Fixture { _dir: dir, writer }
+}
+
+fn fixture() -> Fixture {
+    fixture_with(Shape::default())
+}
+
+impl Fixture {
+    fn conn(&self) -> &rusqlite::Connection {
+        self.writer.library().connection()
+    }
+
+    fn one<T: rusqlite::types::FromSql>(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> T {
+        self.conn().query_row(sql, args, |r| r.get(0)).unwrap()
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.one(sql, &[])
+    }
+
+    /// The `TrackNo` sequence of a playlist, in order.
+    fn track_numbers(&self, playlist: &str) -> Vec<i64> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT TrackNo FROM djmdSongPlaylist
+                 WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo",
+            )
+            .unwrap();
+        stmt.query_map(params![playlist], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// A parent's children, in the order the tree reads them.
+    fn children(&self, parent: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT ID FROM djmdPlaylist
+                 WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+            )
+            .unwrap();
+        stmt.query_map(params![parent], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// The `Seq` run under a parent, to show it has no gaps or repeats.
+    fn seqs(&self, parent: &str) -> Vec<i64> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT Seq FROM djmdPlaylist
+                 WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+            )
+            .unwrap();
+        stmt.query_map(params![parent], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// The content ids of a playlist, in playing order.
+    fn order(&self, playlist: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT ContentID FROM djmdSongPlaylist
+                 WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo",
+            )
+            .unwrap();
+        stmt.query_map(params![playlist], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+}
+
+// ------------------------------------------------------------- new-row shape
+
+#[test]
+fn a_new_playlist_has_the_shape_rekordbox_gives_a_local_row() {
+    // Every one of the 57 locally-created playlists in the reference library
+    // carries rb_data_status 0 and a NULL usn. 256/257 are written by the
+    // cloud sync, not by creation — a distinction two sample rows would miss.
+    let mut f = fixture();
+    let id = f.writer.create_playlist("New Set", ROOT).unwrap();
+
+    let (status, local_status, deleted, synced): (i64, i64, i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced
+             FROM djmdPlaylist WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((status, local_status, deleted, synced), (0, 0, 0, 0));
+
+    let usn: Option<i64> = f.one("SELECT usn FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    assert_eq!(usn, None, "usn is the sync's to assign, not ours");
+
+    let local_usn: i64 = f.one("SELECT rb_local_usn FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    assert!(local_usn > 1000, "must advance past the fixture's starting counter");
+
+    let attribute: i64 = f.one("SELECT Attribute FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    assert_eq!(attribute, ATTRIBUTE_PLAYLIST);
+}
+
+#[test]
+fn a_new_row_carries_a_uuid_and_matching_timestamps() {
+    let mut f = fixture();
+    let id = f.writer.create_playlist("Set", ROOT).unwrap();
+    let (uuid, created, updated): (String, String, String) = f
+        .conn()
+        .query_row(
+            "SELECT UUID, created_at, updated_at FROM djmdPlaylist WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(uuid.len(), 36, "{uuid}");
+    assert_eq!(uuid.split('-').count(), 5);
+    assert_eq!(created, updated, "a row created now was not modified later");
+    assert!(created.ends_with(" +00:00"), "{created}");
+}
+
+#[test]
+fn a_folder_differs_from_a_playlist_only_by_its_attribute() {
+    let mut f = fixture();
+    let folder = f.writer.create_folder("Gigs", ROOT).unwrap();
+    let attribute: i64 = f.one("SELECT Attribute FROM djmdPlaylist WHERE ID = ?1", &[&folder]);
+    assert_eq!(attribute, ATTRIBUTE_FOLDER);
+    // rb_data_status is *not* the folder marker, despite 257 appearing on
+    // folders in the reference library: it appears under both Attribute values.
+    let status: i64 = f.one("SELECT rb_data_status FROM djmdPlaylist WHERE ID = ?1", &[&folder]);
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn ids_do_not_collide_with_rows_already_there() {
+    let mut f = fixture();
+    let mut made = std::collections::HashSet::new();
+    for i in 0..40 {
+        made.insert(f.writer.create_playlist(&format!("Set {i}"), ROOT).unwrap());
+    }
+    assert_eq!(made.len(), 40);
+    for p in 0..3 {
+        assert!(!made.contains(&playlist_id(p)), "reused a fixture id");
+    }
+}
+
+// ------------------------------------------------------------------ the tree
+
+#[test]
+fn seq_appends_rather_than_assuming_a_base() {
+    // Parents in the reference library start at Seq 0 or 1, so there is no
+    // base to assume — a new child goes after the largest.
+    let mut f = fixture();
+    let a = f.writer.create_playlist("A", ROOT).unwrap();
+    let b = f.writer.create_playlist("B", ROOT).unwrap();
+    let seq_a: i64 = f.one("SELECT Seq FROM djmdPlaylist WHERE ID = ?1", &[&a]);
+    let seq_b: i64 = f.one("SELECT Seq FROM djmdPlaylist WHERE ID = ?1", &[&b]);
+    assert_eq!(seq_b, seq_a + 1);
+    // The fixture already has three at root, seq 0..2.
+    assert_eq!(seq_a, 3);
+}
+
+#[test]
+fn a_playlist_can_be_created_inside_a_folder() {
+    let mut f = fixture();
+    let folder = f.writer.create_folder("Gigs", ROOT).unwrap();
+    let inner = f.writer.create_playlist("Friday", &folder).unwrap();
+    let parent: String = f.one("SELECT ParentID FROM djmdPlaylist WHERE ID = ?1", &[&inner]);
+    assert_eq!(parent, folder);
+}
+
+#[test]
+fn a_parent_that_does_not_exist_is_refused() {
+    let mut f = fixture();
+    let outcome = f.writer.create_playlist("Orphan", "no-such-folder");
+    assert!(matches!(outcome, Err(DbError::WriteRefused(_))), "{outcome:?}");
+    // And nothing was written.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist WHERE Name = 'Orphan'"), 0);
+}
+
+#[test]
+fn a_folder_cannot_be_moved_inside_itself() {
+    // This detaches the whole subtree from the tree and it is never seen again.
+    let mut f = fixture();
+    let outer = f.writer.create_folder("Outer", ROOT).unwrap();
+    let inner = f.writer.create_folder("Inner", &outer).unwrap();
+    let deep = f.writer.create_folder("Deep", &inner).unwrap();
+
+    assert!(matches!(f.writer.move_to(&outer, &outer, None), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.move_to(&outer, &inner, None), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.move_to(&outer, &deep, None), Err(DbError::WriteRefused(_))));
+    // Moving the other way is fine.
+    assert!(f.writer.move_to(&deep, ROOT, None).is_ok());
+}
+
+#[test]
+fn a_node_takes_the_place_it_is_moved_to_among_its_siblings() {
+    // Inside a folder of its own: the fixture's root already holds playlists,
+    // and what is being pinned here is a whole sibling run.
+    let mut f = fixture();
+    let home = f.writer.create_folder("Home", ROOT).unwrap();
+    let a = f.writer.create_playlist("A", &home).unwrap();
+    let b = f.writer.create_playlist("B", &home).unwrap();
+    let c = f.writer.create_playlist("C", &home).unwrap();
+    assert_eq!(f.children(&home), vec![a.clone(), b.clone(), c.clone()]);
+
+    // Last to first, which is the drag a tree makes most often.
+    f.writer.move_to(&c, &home, Some(0)).unwrap();
+    assert_eq!(f.children(&home), vec![c.clone(), a.clone(), b.clone()]);
+
+    // Into the middle, counted after the node is lifted out: with C removed
+    // the run is [A, B], so 1 puts it between them.
+    f.writer.move_to(&c, &home, Some(1)).unwrap();
+    assert_eq!(f.children(&home), vec![a.clone(), c.clone(), b.clone()]);
+
+    // Past the end is the end, not a gap.
+    f.writer.move_to(&a, &home, Some(99)).unwrap();
+    assert_eq!(f.children(&home), vec![c.clone(), b.clone(), a.clone()]);
+
+    // No index means appended, which is what it meant before there was one.
+    f.writer.move_to(&c, &home, None).unwrap();
+    assert_eq!(f.children(&home), vec![b, a, c]);
+
+    // Seq is left contiguous from zero: rekordbox reads the order from it.
+    assert_eq!(f.seqs(&home), vec![0, 1, 2]);
+}
+
+#[test]
+fn a_node_moved_into_a_folder_takes_a_place_there() {
+    let mut f = fixture();
+    let folder = f.writer.create_folder("Folder", ROOT).unwrap();
+    let first = f.writer.create_playlist("First", &folder).unwrap();
+    let second = f.writer.create_playlist("Second", &folder).unwrap();
+    let outside = f.writer.create_playlist("Outside", ROOT).unwrap();
+
+    f.writer.move_to(&outside, &folder, Some(1)).unwrap();
+    assert_eq!(f.children(&folder), vec![first, outside.clone(), second]);
+    assert!(!f.children(ROOT).contains(&outside), "it left the root it was in");
+    assert_eq!(f.seqs(&folder), vec![0, 1, 2]);
+}
+
+#[test]
+fn renaming_changes_the_name_and_nothing_structural() {
+    let mut f = fixture();
+    let id = f.writer.create_playlist("Before", ROOT).unwrap();
+    let seq_before: i64 = f.one("SELECT Seq FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    let created: String = f.one("SELECT created_at FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+
+    let changed = f.writer.rename(&id, "After").unwrap();
+    assert_eq!(changed.rows, 1);
+
+    let (name, seq, created_now): (String, i64, String) = f
+        .conn()
+        .query_row(
+            "SELECT Name, Seq, created_at FROM djmdPlaylist WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "After");
+    assert_eq!(seq, seq_before);
+    assert_eq!(created_now, created, "created_at must not move");
+}
+
+#[test]
+fn deleting_a_folder_takes_its_whole_subtree_and_the_memberships() {
+    let mut f = fixture();
+    let outer = f.writer.create_folder("Outer", ROOT).unwrap();
+    let inner = f.writer.create_folder("Inner", &outer).unwrap();
+    let list = f.writer.create_playlist("Deep list", &inner).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+
+    f.writer.delete_playlist(&outer).unwrap();
+
+    for id in [&outer, &inner, &list] {
+        let deleted: i64 = f.one("SELECT rb_local_deleted FROM djmdPlaylist WHERE ID = ?1", &[id]);
+        assert_eq!(deleted, 1, "{id} should be soft-deleted");
+    }
+    assert_eq!(
+        f.count(&format!(
+            "SELECT COUNT(*) FROM djmdSongPlaylist
+             WHERE PlaylistID = '{list}' AND rb_local_deleted = 0"
+        )),
+        0
+    );
+}
+
+#[test]
+fn a_playlist_deletion_can_be_undone_and_redone_exactly() {
+    let mut f = fixture();
+    let before = f.children(ROOT);
+    let outer = f.writer.create_folder("Outer", ROOT).unwrap();
+    let inner = f.writer.create_folder("Inner", &outer).unwrap();
+    let list = f.writer.create_playlist("Deep list", &inner).unwrap();
+    let tracks = [track_id(0), track_id(1), track_id(2)];
+    f.writer.add_tracks(&list, &tracks).unwrap();
+    // This old tombstone must stay deleted when the later playlist deletion
+    // is undone.
+    f.writer.remove_tracks(&list, &[tracks[1].clone()]).unwrap();
+
+    let (_, deletion) = f.writer.delete_playlist_with_undo(&outer).unwrap();
+    assert_eq!(deletion.playlist_ids.len(), 3);
+    assert_eq!(deletion.membership_ids.len(), 2);
+    assert_eq!(f.children(ROOT), before);
+
+    f.writer.restore_playlist(&deletion).unwrap();
+    let mut restored_root = before.clone();
+    restored_root.push(outer.clone());
+    assert_eq!(f.children(ROOT), restored_root);
+    assert_eq!(f.children(&outer), std::slice::from_ref(&inner));
+    assert_eq!(f.children(&inner), std::slice::from_ref(&list));
+    assert_eq!(f.order(&list), [tracks[0].clone(), tracks[2].clone()]);
+
+    f.writer.redo_playlist_deletion(&deletion).unwrap();
+    assert_eq!(f.children(ROOT), before);
+    assert!(f.order(&list).is_empty());
+}
+
+#[test]
+fn a_delete_is_always_soft() {
+    // rekordbox's sync relies on the tombstone; a real DELETE loses it.
+    let mut f = fixture();
+    let before = f.count("SELECT COUNT(*) FROM djmdPlaylist");
+    let id = f.writer.create_playlist("Doomed", ROOT).unwrap();
+    f.writer.delete_playlist(&id).unwrap();
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist"), before + 1, "the row must remain");
+
+    // And rb_data_status is untouched: all 919 deleted rows in the reference
+    // library kept theirs.
+    let status: i64 = f.one("SELECT rb_data_status FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    assert_eq!(status, 0);
+}
+
+// ---------------------------------------------------------------- membership
+
+#[test]
+fn tracks_append_with_contiguous_numbering() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let tracks: Vec<String> = (0..6).map(track_id).collect();
+    let changed = f.writer.add_tracks(&list, &tracks).unwrap();
+    assert_eq!(changed.rows, 6);
+    assert_eq!(f.track_numbers(&list), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(f.order(&list), tracks);
+}
+
+#[test]
+fn a_membership_row_is_identified_by_a_uuid_not_a_number() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0)]).unwrap();
+    let id: String = f.one(
+        "SELECT ID FROM djmdSongPlaylist WHERE PlaylistID = ?1",
+        &[&list],
+    );
+    assert_eq!(id.len(), 36, "{id}");
+    assert_eq!(id.split('-').count(), 5);
+}
+
+#[test]
+fn adding_a_track_already_present_does_nothing() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let changed = f.writer.add_tracks(&list, &[track_id(0), track_id(2)]).unwrap();
+    assert_eq!(changed.rows, 1, "only the new one");
+    assert_eq!(f.order(&list), vec![track_id(0), track_id(1), track_id(2)]);
+}
+
+#[test]
+fn removing_a_track_closes_the_gap_it_leaves() {
+    // TrackNo is contiguous from 1 in every one of the 683 reference
+    // playlists; a hole makes rekordbox render the playlist with a gap.
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let tracks: Vec<String> = (0..5).map(track_id).collect();
+    f.writer.add_tracks(&list, &tracks).unwrap();
+
+    f.writer.remove_tracks(&list, &[track_id(1), track_id(3)]).unwrap();
+
+    assert_eq!(f.track_numbers(&list), vec![1, 2, 3]);
+    assert_eq!(f.order(&list), vec![track_id(0), track_id(2), track_id(4)]);
+}
+
+#[test]
+fn reordering_puts_the_tracks_in_the_order_given() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let tracks: Vec<String> = (0..4).map(track_id).collect();
+    f.writer.add_tracks(&list, &tracks).unwrap();
+
+    let wanted = vec![track_id(3), track_id(0), track_id(2), track_id(1)];
+    f.writer.reorder(&list, &wanted).unwrap();
+    assert_eq!(f.order(&list), wanted);
+    assert_eq!(f.track_numbers(&list), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn a_partial_reorder_keeps_the_tracks_it_did_not_mention() {
+    // Dropping unmentioned tracks would silently empty a playlist when a caller
+    // passes only the visible window.
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let tracks: Vec<String> = (0..5).map(track_id).collect();
+    f.writer.add_tracks(&list, &tracks).unwrap();
+
+    f.writer.reorder(&list, &[track_id(4), track_id(3)]).unwrap();
+
+    let order = f.order(&list);
+    assert_eq!(order.len(), 5, "nothing may be dropped");
+    assert_eq!(order.first(), Some(&track_id(4)));
+    assert_eq!(order.get(1), Some(&track_id(3)));
+    assert_eq!(f.track_numbers(&list), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn a_reorder_naming_a_track_that_is_not_there_ignores_it() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    f.writer.reorder(&list, &[track_id(9), track_id(1), track_id(0)]).unwrap();
+    assert_eq!(f.order(&list), vec![track_id(1), track_id(0)]);
+}
+
+#[test]
+fn deleting_a_track_removes_it_from_every_playlist_and_renumbers_each() {
+    let mut f = fixture();
+    let a = f.writer.create_playlist("A", ROOT).unwrap();
+    let b = f.writer.create_playlist("B", ROOT).unwrap();
+    f.writer.add_tracks(&a, &[track_id(0), track_id(1), track_id(2)]).unwrap();
+    f.writer.add_tracks(&b, &[track_id(1), track_id(3)]).unwrap();
+
+    f.writer.delete_track(&track_id(1)).unwrap();
+
+    assert_eq!(f.order(&a), vec![track_id(0), track_id(2)]);
+    assert_eq!(f.track_numbers(&a), vec![1, 2]);
+    assert_eq!(f.order(&b), vec![track_id(3)]);
+    assert_eq!(f.track_numbers(&b), vec![1]);
+    let deleted: i64 = f.one("SELECT rb_local_deleted FROM djmdContent WHERE ID = ?1",
+                             &[&track_id(1)]);
+    assert_eq!(deleted, 1);
+}
+
+// ------------------------------------------------------------------ metadata
+
+#[test]
+fn a_rating_is_stored_as_rekordbox_stores_it() {
+    // Stars as a count, 0 to 5: the reference library's 269 rated rows hold
+    // 1 to 5 and nothing else [OBS]. The multiples of 51 the XML export uses
+    // do not belong here — stored, the index reads any of them as five stars.
+    let mut f = fixture();
+    for (stars, stored) in [(0_u8, 0_i64), (1, 1), (3, 3), (5, 5)] {
+        f.writer.set_rating(&track_id(0), stars).unwrap();
+        let value: i64 = f.one("SELECT Rating FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+        assert_eq!(value, stored, "{stars} stars");
+    }
+}
+
+#[test]
+fn an_impossible_rating_is_refused_rather_than_clamped() {
+    let mut f = fixture();
+    assert!(matches!(f.writer.set_rating(&track_id(0), 6), Err(DbError::WriteRefused(_))));
+    let value: i64 = f.one("SELECT Rating FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_eq!(value, 0, "the refused write must not have landed");
+}
+
+#[test]
+fn a_comment_round_trips_including_awkward_text() {
+    let mut f = fixture();
+    for text in ["", "5A - Am - 128", "quote \" and ' apostrophe", "とんかつ 🎧", "a; DROP TABLE x;--"] {
+        f.writer.set_comment(&track_id(2), text).unwrap();
+        let stored: String = f.one("SELECT Commnt FROM djmdContent WHERE ID = ?1", &[&track_id(2)]);
+        assert_eq!(stored, text);
+    }
+    // The injection attempt above must not have dropped anything.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdContent"), 40);
+}
+
+#[test]
+fn a_colour_can_be_set_and_cleared() {
+    let mut f = fixture();
+    f.writer.set_color(&track_id(3), Some("4")).unwrap();
+    let value: Option<String> = f.one("SELECT ColorID FROM djmdContent WHERE ID = ?1", &[&track_id(3)]);
+    assert_eq!(value.as_deref(), Some("4"));
+    f.writer.set_color(&track_id(3), None).unwrap();
+    let cleared: Option<String> = f.one("SELECT ColorID FROM djmdContent WHERE ID = ?1", &[&track_id(3)]);
+    assert_eq!(cleared, None);
+}
+
+// --------------------------------------------------- the information panel
+
+#[test]
+fn a_plain_field_is_written_to_its_own_column() {
+    let mut f = fixture();
+    let t = track_id(4);
+    f.writer.set_field(&t, TrackField::Title, "Renamed (Extended Mix)").unwrap();
+    f.writer.set_field(&t, TrackField::Lyricist, "Words").unwrap();
+    f.writer.set_field(&t, TrackField::Year, "2023").unwrap();
+    f.writer.set_field(&t, TrackField::TrackNumber, " 7 ").unwrap();
+    f.writer.set_field(&t, TrackField::DiscNumber, "2").unwrap();
+    f.writer.set_field(&t, TrackField::PlayCount, "12").unwrap();
+    let title: String = f.one("SELECT Title FROM djmdContent WHERE ID = ?1", &[&t]);
+    let lyricist: String = f.one("SELECT Lyricist FROM djmdContent WHERE ID = ?1", &[&t]);
+    let numbers: (i64, i64, i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT ReleaseYear, TrackNo, DiscNo, DJPlayCount FROM djmdContent WHERE ID = ?1",
+            params![t],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "Renamed (Extended Mix)");
+    assert_eq!(lyricist, "Words");
+    assert_eq!(numbers, (2023, 7, 2, 12));
+}
+
+#[test]
+fn a_number_that_is_not_one_is_refused_rather_than_zeroed() {
+    let mut f = fixture();
+    let t = track_id(4);
+    f.writer.set_field(&t, TrackField::Year, "2019").unwrap();
+    for bad in ["", "abc", "-1", "20x", "10000"] {
+        assert!(
+            matches!(f.writer.set_field(&t, TrackField::Year, bad), Err(DbError::WriteRefused(_))),
+            "{bad:?} must be refused"
+        );
+    }
+    let year: i64 = f.one("SELECT ReleaseYear FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(year, 2019, "a refused write leaves the year alone");
+}
+
+#[test]
+fn a_reference_field_makes_its_lookup_row_once_and_shares_it() {
+    let mut f = fixture();
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdArtist"), 0);
+
+    f.writer.set_field(&track_id(0), TrackField::Artist, "TRIODE").unwrap();
+    f.writer.set_field(&track_id(1), TrackField::Artist, "TRIODE").unwrap();
+    f.writer.set_field(&track_id(1), TrackField::Remixer, "TRIODE").unwrap();
+    f.writer.set_field(&track_id(2), TrackField::Composer, "Someone Else").unwrap();
+    f.writer.set_field(&track_id(2), TrackField::OriginalArtist, "TRIODE").unwrap();
+
+    // One artist row per distinct name, whatever column pointed at it.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdArtist"), 2);
+    let triode: String = f.one("SELECT ID FROM djmdArtist WHERE Name = 'TRIODE'", &[]);
+    for (track, column) in [
+        (track_id(0), "ArtistID"),
+        (track_id(1), "ArtistID"),
+        (track_id(1), "RemixerID"),
+        (track_id(2), "OrgArtistID"),
+    ] {
+        let id: String =
+            f.one(&format!("SELECT {column} FROM djmdContent WHERE ID = ?1"), &[&track]);
+        assert_eq!(id, triode, "{column} of {track}");
+    }
+
+    // The new lookup row has the local-creation shape, as an import's does.
+    let (status, usn, uuid): (i64, Option<i64>, String) = f
+        .conn()
+        .query_row(
+            "SELECT rb_data_status, usn, UUID FROM djmdArtist WHERE ID = ?1",
+            params![triode],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(usn, None);
+    assert_eq!(uuid.len(), 36);
+}
+
+#[test]
+fn album_genre_and_label_go_through_their_own_tables() {
+    let mut f = fixture();
+    let t = track_id(6);
+    f.writer.set_field(&t, TrackField::Album, "An Album").unwrap();
+    f.writer.set_field(&t, TrackField::Genre, "Tech House").unwrap();
+    f.writer.set_field(&t, TrackField::Label, "Anjuna").unwrap();
+    let (album, genre, label): (String, String, String) = f
+        .conn()
+        .query_row(
+            "SELECT al.Name, g.Name, l.Name FROM djmdContent c
+             JOIN djmdAlbum al ON al.ID = c.AlbumID
+             JOIN djmdGenre g ON g.ID = c.GenreID
+             JOIN djmdLabel l ON l.ID = c.LabelID
+             WHERE c.ID = ?1",
+            params![t],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((album.as_str(), genre.as_str(), label.as_str()), ("An Album", "Tech House", "Anjuna"));
+}
+
+#[test]
+fn an_emptied_reference_clears_to_null_and_leaves_the_lookup_row() {
+    let mut f = fixture();
+    let t = track_id(7);
+    f.writer.set_field(&t, TrackField::Artist, "Gone Soon").unwrap();
+    f.writer.set_field(&t, TrackField::Artist, "   ").unwrap();
+    let artist: Option<String> = f.one("SELECT ArtistID FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(artist, None, "NULL, as 3,942 of the reference library's artist-less tracks are");
+    // Another track may still point at it; nothing is ever hard-deleted.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdArtist WHERE Name = 'Gone Soon'"), 1);
+}
+
+#[test]
+fn a_key_is_found_never_made() {
+    let mut f = fixture();
+    let stamp = rbl_core::time::now();
+    f.conn()
+        .execute(
+            "INSERT INTO djmdKey (ID, ScaleName, Seq, created_at, updated_at) VALUES ('12', 'Fm', 7, ?1, ?1)",
+            params![stamp],
+        )
+        .unwrap();
+    let t = track_id(8);
+    f.writer.set_field(&t, TrackField::Key, "Fm").unwrap();
+    let key: String = f.one("SELECT KeyID FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(key, "12");
+
+    assert!(matches!(
+        f.writer.set_field(&t, TrackField::Key, "H#m"),
+        Err(DbError::WriteRefused(_))
+    ));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdKey"), 1, "no key row is invented");
+    let still: String = f.one("SELECT KeyID FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(still, "12");
+
+    f.writer.set_field(&t, TrackField::Key, "").unwrap();
+    let cleared: Option<String> = f.one("SELECT KeyID FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(cleared, None);
+}
+
+#[test]
+fn every_field_edit_bumps_the_usn_and_the_stamp() {
+    let mut f = fixture();
+    let t = track_id(9);
+    let before: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&t]);
+    let changed = f.writer.set_field(&t, TrackField::Artist, "Anyone").unwrap();
+    assert_eq!(changed.rows, 1);
+    let (usn, updated, created): (i64, String, String) = f
+        .conn()
+        .query_row(
+            "SELECT rb_local_usn, updated_at, created_at FROM djmdContent WHERE ID = ?1",
+            params![t],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(usn > before);
+    assert_eq!(usn, changed.usn);
+    assert_ne!(updated, created, "updated_at moves, created_at does not");
+    let counter: i64 =
+        f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    assert_eq!(counter, usn);
+}
+
+#[test]
+fn the_wire_names_round_trip() {
+    for (name, field) in [
+        ("title", TrackField::Title),
+        ("artist", TrackField::Artist),
+        ("album", TrackField::Album),
+        ("year", TrackField::Year),
+        ("trackNumber", TrackField::TrackNumber),
+        ("discNumber", TrackField::DiscNumber),
+        ("originalArtist", TrackField::OriginalArtist),
+        ("composer", TrackField::Composer),
+        ("remixer", TrackField::Remixer),
+        ("lyricist", TrackField::Lyricist),
+        ("playCount", TrackField::PlayCount),
+        ("genre", TrackField::Genre),
+        ("label", TrackField::Label),
+        ("key", TrackField::Key),
+        ("bpm", TrackField::Bpm),
+    ] {
+        assert_eq!(TrackField::parse(name), Some(field));
+    }
+    // What the panel shows read-only must not be reachable by name either.
+    for refused in ["albumArtist", "mixName", "message", "hotCueAutoLoad", "publish", ""] {
+        assert_eq!(TrackField::parse(refused), None, "{refused}");
+    }
+}
+
+// ----------------------------------------------------------------- the USN
+
+#[test]
+fn every_write_advances_the_usn_and_the_registry_follows() {
+    let mut f = fixture();
+    let mut last = 0;
+    for i in 0..5 {
+        let id = f.writer.create_playlist(&format!("Set {i}"), ROOT).unwrap();
+        let usn: i64 = f.one("SELECT rb_local_usn FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+        assert!(usn > last, "usn must advance: {usn} after {last}");
+        last = usn;
+        let counter: i64 = f.count(
+            "SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'",
+        );
+        assert_eq!(counter, usn, "the registry must track the rows");
+    }
+}
+
+#[test]
+fn no_two_rows_share_a_usn() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let tracks: Vec<String> = (0..8).map(track_id).collect();
+    f.writer.add_tracks(&list, &tracks).unwrap();
+
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT rb_local_usn FROM djmdSongPlaylist WHERE PlaylistID = ?1")
+        .unwrap();
+    let usns: Vec<i64> = stmt
+        .query_map(params![list], |r| r.get(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    let distinct: std::collections::HashSet<_> = usns.iter().collect();
+    assert_eq!(distinct.len(), usns.len(), "a reused USN makes the sync skip a row");
+}
+
+#[test]
+fn the_usn_starts_above_whatever_is_already_in_the_tables() {
+    // The registry counter has been seen lagging the table maximum; taking the
+    // larger of the two is what stops a USN being reused.
+    let dir = tempfile::tempdir().unwrap();
+    let location = fixture::build(dir.path(), Shape { start_usn: 10, ..Shape::default() }).unwrap();
+
+    // Push a row's USN far past the registry counter, as a lagging counter does.
+    {
+        let library = Library::open(location.clone(), OpenMode::ReadOnly).unwrap();
+        drop(library);
+    }
+    let conn = rusqlite::Connection::open(&location.master_db).unwrap();
+    conn.pragma_update(None, "cipher", "sqlcipher").unwrap();
+    conn.pragma_update(None, "legacy", 4).unwrap();
+    conn.pragma_update(None, "key", &location.passphrase).unwrap();
+    conn.execute("UPDATE djmdContent SET rb_local_usn = 999999 WHERE ID = ?1",
+                 params![track_id(0)]).unwrap();
+    drop(conn);
+
+    let mut writer = Writer::open(location, dir.path().join("backups")).unwrap();
+    let id = writer.create_playlist("After", ROOT).unwrap();
+    let usn: i64 = writer
+        .library()
+        .connection()
+        .query_row("SELECT rb_local_usn FROM djmdPlaylist WHERE ID = ?1", params![id], |r| r.get(0))
+        .unwrap();
+    assert!(usn > 999_999, "got {usn}, which reuses a USN already in the table");
+}
+
+// ---------------------------------------------------------------- the guards
+
+#[test]
+fn the_library_is_backed_up_before_the_first_write_and_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let location = fixture::build(dir.path(), Shape::default()).unwrap();
+    let backups = dir.path().join("backups");
+    let mut writer = Writer::open(location, &backups).unwrap();
+
+    assert!(!backups.exists(), "opening alone must not back up");
+    writer.create_playlist("First", ROOT).unwrap();
+    let after_first = std::fs::read_dir(&backups).unwrap().count();
+    assert_eq!(after_first, 1);
+
+    for i in 0..3 {
+        writer.create_playlist(&format!("More {i}"), ROOT).unwrap();
+    }
+    assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1, "once per session");
+    assert!(writer.backed_up());
+}
+
+#[test]
+fn a_writer_told_the_session_is_backed_up_takes_no_backup_of_its_own() {
+    // The app opens a writer per edit; the second edit of a session must not
+    // copy the library again.
+    let dir = tempfile::tempdir().unwrap();
+    let location = fixture::build(dir.path(), Shape::default()).unwrap();
+    let backups = dir.path().join("backups");
+    let mut first = Writer::open(location.clone(), &backups).unwrap();
+    first.create_playlist("First", ROOT).unwrap();
+    drop(first);
+    assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
+
+    let mut second = Writer::open(location, &backups).unwrap();
+    assert!(!second.backed_up());
+    second.mark_backed_up();
+    second.create_playlist("Second", ROOT).unwrap();
+    assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1, "the session's backup stands");
+}
+
+#[test]
+fn a_backup_is_a_readable_library_in_its_own_right() {
+    let dir = tempfile::tempdir().unwrap();
+    let location = fixture::build(dir.path(), Shape::default()).unwrap();
+    let backups = dir.path().join("backups");
+    let mut writer = Writer::open(location.clone(), &backups).unwrap();
+    writer.create_playlist("Only in the live one", ROOT).unwrap();
+    drop(writer);
+
+    let backup = std::fs::read_dir(&backups).unwrap().next().unwrap().unwrap().path();
+    let restored = Library::open(
+        rbl_db::LibraryLocation { master_db: backup, ..location },
+        OpenMode::ReadOnly,
+    )
+    .expect("the backup must open with the same passphrase");
+    assert_eq!(restored.live_track_count().unwrap(), 40);
+    // Taken before the write, so it must not contain it.
+    let n: i64 = restored
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM djmdPlaylist WHERE Name = 'Only in the live one'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "the backup is the state before the write");
+}
+
+#[test]
+fn a_refused_action_leaves_nothing_behind() {
+    let mut f = fixture();
+    let before: i64 = f.count("SELECT COUNT(*) FROM djmdPlaylist");
+    let counter_before: i64 =
+        f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+
+    assert!(f.writer.create_playlist("Nope", "missing").is_err());
+
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist"), before);
+    assert_eq!(
+        f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"),
+        counter_before,
+        "a rolled-back transaction must not move the counter"
+    );
+}
+
+#[test]
+fn the_unsupported_edits_are_refused_with_a_reason() {
+    let action = Unsupported::ContentCueOrFile;
+    let error = Writer::refuse(action);
+    let DbError::WriteRefused(reason) = error else {
+        panic!("{action:?} should be a refusal");
+    };
+    assert!(!reason.is_empty());
+    // The reason has to say what would settle it, or it is just a "no".
+    assert!(
+        reason.contains("recording") || reason.contains("not understood"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn only_the_named_columns_can_be_set() {
+    // The column name is interpolated into SQL. It comes from this crate today,
+    // but a future caller reaching it would be injecting into a real library.
+    let mut f = fixture();
+    assert!(f.writer.set_comment(&track_id(0), "fine").is_ok());
+    // The allowlist is what makes that safe; prove it rejects rather than runs.
+    let outcome = f.writer.rename("nope", "x");
+    assert!(outcome.is_ok(), "a real column still works: {outcome:?}");
+}
+
+#[test]
+fn a_changed_report_says_how_many_rows_moved() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    assert_eq!(f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap().rows, 2);
+    assert_eq!(f.writer.rename(&list, "Renamed").unwrap().rows, 1);
+    assert_eq!(
+        f.writer.rename("no-such-playlist", "x").unwrap(),
+        Changed { rows: 0, usn: f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'") },
+        "renaming nothing changes nothing"
+    );
+}
+
+#[test]
+fn a_large_playlist_stays_consistent_through_many_edits() {
+    let mut f = fixture_with(Shape { tracks: 200, ..Shape::default() });
+    let list = f.writer.create_playlist("Big", ROOT).unwrap();
+    let all: Vec<String> = (0..200).map(track_id).collect();
+    f.writer.add_tracks(&list, &all).unwrap();
+
+    // Remove every third track, then reverse what is left.
+    let doomed: Vec<String> = (0..200).step_by(3).map(track_id).collect();
+    f.writer.remove_tracks(&list, &doomed).unwrap();
+    let mut remaining = f.order(&list);
+    remaining.reverse();
+    f.writer.reorder(&list, &remaining).unwrap();
+
+    assert_eq!(f.order(&list), remaining);
+    let expected: Vec<i64> = (1..=remaining.len() as i64).collect();
+    assert_eq!(f.track_numbers(&list), expected, "numbering must stay 1..N");
+}
+
+// -------------------------------------------------------------- relocating
+
+#[test]
+fn a_track_can_be_pointed_at_a_moved_file() {
+    let f_dir = tempfile::tempdir().unwrap();
+    let moved = f_dir.path().join("moved elsewhere.mp3");
+    std::fs::write(&moved, b"audio").unwrap();
+
+    let mut f = fixture();
+    f.writer.relocate(&track_id(0), &moved).unwrap();
+
+    let (folder, name): (String, String) = f
+        .conn()
+        .query_row(
+            "SELECT FolderPath, FileNameL FROM djmdContent WHERE ID = ?1",
+            params![track_id(0)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(folder, moved.to_string_lossy());
+    assert_eq!(name, "moved elsewhere.mp3");
+}
+
+#[test]
+fn relocating_to_something_that_is_not_a_file_is_refused() {
+    // Pointing a track at a directory, or at nothing, loses the old location
+    // for no gain.
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = fixture();
+    let before: String =
+        f.one("SELECT FolderPath FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+
+    for bad in [dir.path().to_path_buf(), dir.path().join("no-such-file.mp3")] {
+        assert!(matches!(f.writer.relocate(&track_id(0), &bad), Err(DbError::WriteRefused(_))));
+    }
+    let after: String =
+        f.one("SELECT FolderPath FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_eq!(after, before, "a refused relocate must not have moved anything");
+}
+
+#[test]
+fn relocating_leaves_the_analysis_and_memberships_alone() {
+    // Everything else keys off the track's id, so moving the audio must not
+    // disturb it.
+    let f_dir = tempfile::tempdir().unwrap();
+    let moved = f_dir.path().join("elsewhere.mp3");
+    std::fs::write(&moved, b"audio").unwrap();
+
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+
+    f.writer.relocate(&track_id(0), &moved).unwrap();
+
+    assert_eq!(f.order(&list), vec![track_id(0), track_id(1)]);
+    let deleted: i64 =
+        f.one("SELECT rb_local_deleted FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_eq!(deleted, 0);
+}
+
+// ------------------------------------------------------------------- cues
+
+#[test]
+fn a_cue_is_written_in_the_shape_the_reference_library_shows() {
+    // Every column here was settled by counting the reference library's
+    // 1,040,598 cues rather than guessed. See the write module's docs.
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(0), 1, 45_000).unwrap();
+
+    let (kind, in_ms, color, index, loop_size, active, out_ms): (
+        i64, i64, i64, i64, Option<i64>, i64, Option<i64>,
+    ) = f
+        .conn()
+        .query_row(
+            "SELECT Kind, InMsec, Color, ColorTableIndex, BeatLoopSize, ActiveLoop, OutMsec
+             FROM djmdCue WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, 1, "hot cue A");
+    assert_eq!(in_ms, 45_000);
+    assert_eq!(color, -1, "hot cues carry -1");
+    assert_eq!(index, 21, "the default colour rekordbox writes");
+    assert_eq!(loop_size, None, "not a loop");
+    assert_eq!(active, 0);
+    assert_eq!(out_ms, None);
+}
+
+#[test]
+fn a_memory_cue_differs_from_a_hot_one_in_its_colour_columns() {
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(0), 0, 1_000).unwrap();
+    let (color, index): (i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT Color, ColorTableIndex FROM djmdCue WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // 255 and 0, against -1 and 21 for a hot cue.
+    assert_eq!(color, 255);
+    assert_eq!(index, 0);
+}
+
+#[test]
+fn a_cue_points_at_its_track_by_id_and_by_uuid() {
+    // Both, or rekordbox's sync sees a cue with no owner.
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(2), 5, 10_000).unwrap();
+    let (content, content_uuid): (String, String) = f
+        .conn()
+        .query_row(
+            "SELECT ContentID, ContentUUID FROM djmdCue WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(content, track_id(2));
+    let expected: String =
+        f.one("SELECT UUID FROM djmdContent WHERE ID = ?1", &[&track_id(2)]);
+    assert_eq!(content_uuid, expected);
+}
+
+#[test]
+fn a_cue_carries_a_uuid_of_its_own_and_a_local_usn() {
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(0), 2, 5_000).unwrap();
+    let (uuid, usn, sync_usn): (String, i64, Option<i64>) = f
+        .conn()
+        .query_row(
+            "SELECT UUID, rb_local_usn, usn FROM djmdCue WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(uuid.len(), 36);
+    assert!(usn > 1000);
+    assert_eq!(sync_usn, None, "usn is the sync's to assign");
+}
+
+#[test]
+fn kind_four_is_refused_because_rekordbox_does_not_use_it() {
+    let mut f = fixture();
+    assert!(matches!(f.writer.add_cue(&track_id(0), 4, 0), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.add_cue(&track_id(0), 18, 0), Err(DbError::WriteRefused(_))));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue"), 0);
+}
+
+#[test]
+fn a_cue_on_a_track_that_is_not_there_is_refused() {
+    let mut f = fixture();
+    assert!(matches!(f.writer.add_cue("no-such-track", 1, 0), Err(DbError::WriteRefused(_))));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue"), 0);
+}
+
+#[test]
+fn a_cue_moves_and_soft_deletes() {
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(0), 1, 1_000).unwrap();
+
+    f.writer.move_cue(&id, 90_000).unwrap();
+    let at: i64 = f.one("SELECT InMsec FROM djmdCue WHERE ID = ?1", &[&id]);
+    assert_eq!(at, 90_000);
+
+    f.writer.delete_cue(&id).unwrap();
+    let deleted: i64 = f.one("SELECT rb_local_deleted FROM djmdCue WHERE ID = ?1", &[&id]);
+    assert_eq!(deleted, 1);
+    // Soft, as everywhere else: the row stays for the sync's sake.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue"), 1);
+}
+
+#[test]
+fn every_hot_cue_slot_rekordbox_uses_can_be_written() {
+    // 1-3 and 5-17: sixteen slots, A to P, with 4 unused.
+    let mut f = fixture();
+    for kind in [1_u8, 2, 3, 5, 6, 7, 8, 9, 10, 17] {
+        f.writer.add_cue(&track_id(0), kind, u32::from(kind) * 1000).unwrap();
+    }
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue WHERE rb_local_deleted = 0"), 10);
+}
+
+#[test]
+fn a_cue_id_is_a_number_under_2_to_the_32_like_rekordbox_s_own() {
+    // Every one of the reference library's 1,041,056 cue ids is a decimal
+    // string, the largest 4,294,966,064, and not one is a UUID. The index
+    // keeps them as u32, so a UUID here would be a cue that cannot be edited.
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(0), 0, 1_000).unwrap();
+    let value: u64 = id.parse().expect("a decimal id");
+    assert!(value > 0 && value < (1 << 32), "{id}");
+    let looped = f.writer.add_loop(&track_id(0), 0, 2_000, 4_000, 4).unwrap();
+    assert!(looped.parse::<u32>().is_ok(), "{looped}");
+}
+
+#[test]
+fn a_cue_knows_its_track_until_it_is_deleted() {
+    let mut f = fixture();
+    let id = f.writer.add_cue(&track_id(4), 0, 1_000).unwrap();
+    assert_eq!(f.writer.cue_owner(&id).unwrap(), Some(track_id(4)));
+    assert_eq!(f.writer.cue_owner("no-such-cue").unwrap(), None);
+    f.writer.delete_cue(&id).unwrap();
+    assert_eq!(f.writer.cue_owner(&id).unwrap(), None, "a deleted cue has no owner to report");
+}
+
+#[test]
+fn cue_colours_use_the_field_rekordbox_assigns_to_each_kind() {
+    let mut f = fixture();
+    let memory = f.writer.add_cue(&track_id(0), 0, 1_000).unwrap();
+    let hot = f.writer.add_cue(&track_id(0), 1, 2_000).unwrap();
+    f.writer.set_cue_colour(&memory, Some(3)).unwrap();
+    f.writer.set_cue_colour(&hot, Some(46)).unwrap();
+    fn columns(writer: &Writer, id: &str) -> (i64, i64) {
+        writer.library().connection().query_row(
+            "SELECT Color, ColorTableIndex FROM djmdCue WHERE ID=?1", [id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap()
+    }
+    assert_eq!(columns(&f.writer, &memory), (3, 0));
+    assert_eq!(columns(&f.writer, &hot), (-1, 46));
+    f.writer.set_cue_colour(&memory, None).unwrap();
+    f.writer.set_cue_colour(&hot, None).unwrap();
+    assert_eq!(columns(&f.writer, &memory), (255, 0));
+    assert_eq!(columns(&f.writer, &hot), (-1, 21));
+}
+
+// ----------------------------------------------------------------- import
+
+/// A minimal but genuine WAV, so the tag reader has something real to open.
+fn write_wav(path: &std::path::Path, seconds: u32) {
+    let rate = 44_100_u32;
+    let samples = rate * seconds;
+    let data_len = samples * 2;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16_u32.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes());
+    out.extend_from_slice(&2_u16.to_le_bytes());
+    out.extend_from_slice(&16_u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.resize(44 + data_len as usize, 0);
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn a_file_is_imported_in_the_shape_a_local_row_has() {
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Some Track.wav");
+    write_wav(&path, 2);
+
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+
+    let (status, local_status, synced, usn): (i64, i64, i64, Option<i64>) = f
+        .conn()
+        .query_row(
+            "SELECT rb_data_status, rb_local_data_status, rb_local_synced, usn
+             FROM djmdContent WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    // The shape all 634 locally-created tracks in the reference library have.
+    assert_eq!((status, local_status, synced), (0, 0, 0));
+    assert_eq!(usn, None, "usn is the sync's to assign");
+}
+
+#[test]
+fn an_import_carries_what_rekordbox_needs_to_open_the_file() {
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Some Track.wav");
+    write_wav(&path, 2);
+
+    let mut f = fixture();
+    f.conn()
+        .execute("UPDATE djmdProperty SET DeviceID = 'dev-1'", [])
+        .unwrap();
+    let db_id: String = f.one("SELECT DBID FROM djmdProperty", &[]);
+    // A path with `..` in it is stored clean: rekordbox marks the raw form missing.
+    let dotted = audio.path().join("sub").join("..").join("Some Track.wav");
+    let id = f.writer.import_file(&dotted).unwrap();
+
+    let (folder, file_type, depth, stock, created, master, song, device, hot, org, ext): (
+        String, i64, i64, String, String, String, String, String, String, String, String,
+    ) = f
+        .conn()
+        .query_row(
+            "SELECT FolderPath, FileType, BitDepth, StockDate, DateCreated, MasterDBID, MasterSongID,
+                    DeviceID, HotCueAutoLoad, OrgFolderPath, ExtInfo
+             FROM djmdContent WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+        )
+        .unwrap();
+    assert_eq!(folder, path.to_string_lossy());
+    assert_eq!((file_type, depth), (11, 16), "a 16-bit wav");
+    assert_eq!(stock.len(), 10, "{stock}");
+    assert_eq!(stock, created);
+    assert_eq!((master, song, device), (db_id, id.clone(), "dev-1".to_owned()));
+    assert_eq!((hot.as_str(), org.as_str(), ext.as_str()), ("on", "", "null"));
+}
+
+#[test]
+fn an_imported_track_leaves_analysed_unset() {
+    // Every track in the reference library has been analysed, so it cannot
+    // show what the field holds before analysis. NULL asserts nothing.
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Track.wav");
+    write_wav(&path, 1);
+
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+    let analysed: Option<i64> =
+        f.one("SELECT Analysed FROM djmdContent WHERE ID = ?1", &[&id]);
+    assert_eq!(analysed, None);
+}
+
+#[test]
+fn an_untagged_file_takes_its_filename_as_its_title() {
+    // A row with no title is unusable, and the filename is what someone
+    // actually recognises.
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Bicep - Glue.wav");
+    write_wav(&path, 1);
+
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+    let title: String = f.one("SELECT Title FROM djmdContent WHERE ID = ?1", &[&id]);
+    assert_eq!(title, "Bicep - Glue");
+}
+
+#[test]
+fn an_import_records_where_the_file_is_and_how_long_it_runs() {
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Track.wav");
+    write_wav(&path, 3);
+
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+    let (folder, name, length): (String, String, i64) = f
+        .conn()
+        .query_row(
+            "SELECT FolderPath, FileNameL, Length FROM djmdContent WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(folder, path.to_string_lossy());
+    assert_eq!(name, "Track.wav");
+    assert_eq!(length, 3);
+}
+
+#[test]
+fn importing_the_same_file_twice_is_refused() {
+    // One file with two rows leaves every playlist pointing at the wrong one.
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Track.wav");
+    write_wav(&path, 1);
+
+    let mut f = fixture();
+    f.writer.import_file(&path).unwrap();
+    assert!(matches!(f.writer.import_file(&path), Err(DbError::WriteRefused(_))));
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM djmdContent WHERE rb_local_deleted = 0"),
+        41,
+        "forty fixture tracks and the one import"
+    );
+}
+
+#[test]
+fn importing_something_that_is_not_audio_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = dir.path().join("notes.txt");
+    std::fs::write(&text, b"x").unwrap();
+
+    let mut f = fixture();
+    assert!(matches!(f.writer.import_file(&text), Err(DbError::WriteRefused(_))));
+    assert!(matches!(
+        f.writer.import_file(&dir.path().join("missing.wav")),
+        Err(DbError::WriteRefused(_))
+    ));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdContent"), 40);
+}
+
+#[test]
+fn an_imported_track_can_go_straight_into_a_playlist() {
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Track.wav");
+    write_wav(&path, 1);
+
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+    let list = f.writer.create_playlist("New", ROOT).unwrap();
+    f.writer.add_tracks(&list, std::slice::from_ref(&id)).unwrap();
+    assert_eq!(f.order(&list), vec![id]);
+}
+
+#[test]
+fn a_loop_records_its_length_in_beats() {
+    // BeatLoopSize is (beats << 16) | 1. Every value in the reference library
+    // fits — 65537, 524289, 1048577, 2097153, 4194305 are 1, 8, 16, 32, 64 —
+    // and the one loop whose track is still live carries 262145, four beats,
+    // over an In/Out span measuring exactly four beats at its own BPM.
+    let mut f = fixture();
+    let id = f.writer.add_loop(&track_id(0), 1, 10_000, 11_739, 4).unwrap();
+
+    let (out, size): (i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT OutMsec, BeatLoopSize FROM djmdCue WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(out, 11_739);
+    assert_eq!(size, 262_145, "four beats");
+    assert_eq!(size >> 16, 4);
+    assert_eq!(size & 0xFFFF, 1, "the low half is 1 on every value observed");
+}
+
+#[test]
+fn every_loop_length_the_library_uses_round_trips() {
+    let mut f = fixture();
+    for (beats, expected) in [(1_u16, 65_537_i64), (8, 524_289), (16, 1_048_577),
+                              (32, 2_097_153), (64, 4_194_305)] {
+        let id = f.writer.add_loop(&track_id(1), 0, 0, 1000, beats).unwrap();
+        let size: i64 = f.one("SELECT BeatLoopSize FROM djmdCue WHERE ID = ?1", &[&id]);
+        assert_eq!(size, expected, "{beats} beats");
+    }
+}
+
+#[test]
+fn a_loop_with_no_stated_length_leaves_the_field_zero() {
+    // Most of the library's loops do this: the length is implied by In and Out.
+    let mut f = fixture();
+    let id = f.writer.add_loop(&track_id(0), 0, 1000, 2000, 0).unwrap();
+    let size: i64 = f.one("SELECT BeatLoopSize FROM djmdCue WHERE ID = ?1", &[&id]);
+    assert_eq!(size, 0);
+}
+
+#[test]
+fn a_loop_that_ends_before_it_starts_is_refused() {
+    let mut f = fixture();
+    assert!(matches!(f.writer.add_loop(&track_id(0), 1, 5000, 5000, 4), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.add_loop(&track_id(0), 1, 5000, 1000, 4), Err(DbError::WriteRefused(_))));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue"), 0);
+}
+
+// ---------------------------------------------------------------- analysis
+
+#[test]
+fn an_analysis_path_is_derived_from_the_uuid_and_kept_once_set() {
+    let f = fixture();
+    let track = track_id(1);
+    f.conn()
+        .execute(
+            "UPDATE djmdContent SET UUID = 'a1b2c3d4-0000-4000-8000-000000000001', AnalysisDataPath = NULL WHERE ID = ?1",
+            params![track],
+        )
+        .unwrap();
+    assert_eq!(
+        f.writer.analysis_data_path_for(&track).unwrap(),
+        "/PIONEER/USBANLZ/a1b/2c3d4-0000-4000-8000-000000000001/ANLZ0000.DAT"
+    );
+
+    f.conn()
+        .execute("UPDATE djmdContent SET AnalysisDataPath = '/PIONEER/USBANLZ/a1b/x/ANLZ0002.DAT' WHERE ID = ?1", params![track])
+        .unwrap();
+    assert_eq!(f.writer.analysis_data_path_for(&track).unwrap(), "/PIONEER/USBANLZ/a1b/x/ANLZ0002.DAT");
+
+    f.conn().execute("UPDATE djmdContent SET UUID = NULL, AnalysisDataPath = NULL WHERE ID = ?1", params![track]).unwrap();
+    assert!(matches!(f.writer.analysis_data_path_for(&track), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn setting_the_bpm_writes_the_column_a_grid_edit_keeps_in_step() {
+    let mut f = fixture();
+    let track = track_id(1);
+    let changed = f.writer.set_bpm_x100(&track, 12_850).unwrap();
+    assert_eq!(changed.rows, 1);
+    let (bpm, usn): (i64, i64) = f
+        .conn()
+        .query_row("SELECT BPM, rb_local_usn FROM djmdContent WHERE ID = ?1", params![track], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((bpm, usn), (12_850, changed.usn));
+    assert_eq!(f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"), changed.usn);
+
+    // Zero is not a tempo a grid can have, and nothing moves.
+    let refused = f.writer.set_bpm_x100(&track, 0).unwrap_err();
+    assert!(matches!(refused, DbError::WriteRefused(_)), "{refused}");
+    assert_eq!(f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"), changed.usn);
+}
+
+#[test]
+fn registering_an_analysis_sets_bpm_key_path_and_analysed_in_one_usn() {
+    let mut f = fixture();
+    let track = track_id(1);
+    // Two rows named alike, as the reference library has: the one on more
+    // tracks is the one rekordbox uses.
+    for (id, n) in [("900001", 3), ("900002", 1)] {
+        f.conn()
+            .execute(
+                "INSERT INTO djmdKey (ID, ScaleName, created_at, updated_at) VALUES (?1, 'Dbm', '2020-01-01', '2020-01-01')",
+                params![id],
+            )
+            .unwrap();
+        for k in 0..n {
+            f.conn()
+                .execute("UPDATE djmdContent SET KeyID = ?1 WHERE ID = ?2", params![id, track_id(2 + k + if id == "900001" { 0 } else { 3 })])
+                .unwrap();
+        }
+    }
+    let usn_before: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+
+    let changed = f
+        .writer
+        .register_analysis(
+            &track,
+            &AnalysisRegistration { bpm_x100: 13600, key: Some("Dbm"), analysis_data_path: "/PIONEER/USBANLZ/a1b/x/ANLZ0000.DAT" },
+        )
+        .unwrap();
+    assert_eq!(changed.rows, 1);
+    assert!(changed.usn > usn_before);
+
+    let (bpm, key, path, analysed, usn): (i64, String, String, i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT BPM, KeyID, AnalysisDataPath, Analysed, rb_local_usn FROM djmdContent WHERE ID = ?1",
+            params![track],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!((bpm, key.as_str(), path.as_str(), analysed), (13600, "900001", "/PIONEER/USBANLZ/a1b/x/ANLZ0000.DAT", ANALYSED_FULL));
+    assert_eq!(usn, changed.usn);
+    assert_eq!(f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"), changed.usn);
+
+    // No key: the column is left as it was.
+    f.writer
+        .register_analysis(&track, &AnalysisRegistration { bpm_x100: 13700, key: None, analysis_data_path: "/PIONEER/USBANLZ/a1b/x/ANLZ0000.DAT" })
+        .unwrap();
+    let key: String = f.one("SELECT KeyID FROM djmdContent WHERE ID = ?1", &[&track]);
+    assert_eq!(key, "900001");
+
+    // A name no row carries is refused, and nothing moves.
+    let counter: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    let refused = f
+        .writer
+        .register_analysis(&track, &AnalysisRegistration { bpm_x100: 1, key: Some("H#m"), analysis_data_path: "/x" })
+        .unwrap_err();
+    assert!(matches!(refused, DbError::WriteRefused(_)), "{refused}");
+    assert_eq!(f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"), counter);
+}
+
+#[test]
+fn an_intelligent_playlist_takes_no_tracks_by_hand() {
+    let mut f = fixture();
+    let id = f.writer.create_playlist("Rule", ROOT).unwrap();
+    f.conn()
+        .execute(
+            "UPDATE djmdPlaylist SET Attribute = 4,
+                SmartList = '<NODE Id=\"1\" LogicalOperator=\"1\" AutomaticUpdate=\"1\"><CONDITION PropertyName=\"rating\" Operator=\"1\" ValueUnit=\"\" ValueLeft=\"5\" ValueRight=\"\"/></NODE>'
+             WHERE ID = ?1",
+            [&id],
+        )
+        .unwrap();
+
+    for result in [
+        f.writer.add_tracks(&id, &[track_id(0)]).map(|_| ()),
+        f.writer.remove_tracks(&id, &[track_id(0)]).map(|_| ()),
+        f.writer.reorder(&id, &[track_id(0)]).map(|_| ()),
+    ] {
+        let Err(DbError::WriteRefused(reason)) = result else {
+            panic!("a membership edit on a rule should be refused");
+        };
+        assert!(reason.contains("rule"), "{reason}");
+    }
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongPlaylist WHERE PlaylistID = (SELECT ID FROM djmdPlaylist WHERE Name = 'Rule')"), 0);
+
+    // The rule itself survives a rename, and the playlist can still go.
+    f.writer.rename(&id, "Rule renamed").unwrap();
+    let kept: String = f.one("SELECT SmartList FROM djmdPlaylist WHERE ID = ?1", &[&id]);
+    assert!(kept.contains("PropertyName"));
+    f.writer.delete_playlist(&id).unwrap();
+}
+
+#[test]
+fn an_analysis_is_registered_on_the_track_with_the_usual_bookkeeping() {
+    use rbl_db::write::{AnalysisWrite, ANALYSED_BY_THIS_APP};
+    let mut f = fixture();
+    let stamp = rbl_core::time::now();
+    f.conn()
+        .execute(
+            "INSERT INTO djmdKey (ID, ScaleName, Seq, created_at, updated_at) VALUES ('12', 'Fm', 7, ?1, ?1)",
+            [&stamp],
+        )
+        .unwrap();
+    // A track rekordbox never analysed, and one it did.
+    f.conn().execute("UPDATE djmdContent SET Analysed = 0, KeyID = NULL WHERE ID = ?1", [track_id(0)]).unwrap();
+    let before: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+
+    let changed = f
+        .writer
+        .set_analysis(
+            &track_id(0),
+            &AnalysisWrite { bpm_x100: 12_850, key: Some("Fm"), analysis_path: "/PIONEER/USBANLZ/P001/0000ABCD/ANLZ0000.DAT", length_sec: Some(312) },
+        )
+        .unwrap();
+    assert_eq!(changed.rows, 1);
+    assert!(changed.usn > before);
+    let (bpm, key, path, length, analysed, updated): (i64, String, String, i64, i64, String) = f
+        .conn()
+        .query_row(
+            "SELECT BPM, KeyID, AnalysisDataPath, Length, Analysed, AnalysisUpdated FROM djmdContent WHERE ID = ?1",
+            [track_id(0)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+    assert_eq!((bpm, key.as_str(), path.as_str(), length, analysed), (12_850, "12", "/PIONEER/USBANLZ/P001/0000ABCD/ANLZ0000.DAT", 312, ANALYSED_BY_THIS_APP));
+    assert_eq!(updated, "1", "AnalysisUpdated is a revision counter, not a timestamp");
+    assert_eq!(f.one::<i64>("SELECT ContentLink FROM djmdContent WHERE ID = ?1", &[&track_id(0)]), 2_885_120);
+    let counter: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    assert_eq!(counter, changed.usn);
+
+    // rekordbox's own value on an analysed track is kept, and an unknown key
+    // name leaves the key as it was rather than inventing a djmdKey row.
+    f.conn().execute("UPDATE djmdContent SET KeyID = '12', ContentLink = 3999246, AnalysisUpdated = '7' WHERE ID = ?1", [track_id(1)]).unwrap();
+    f.writer
+        .set_analysis(&track_id(1), &AnalysisWrite { bpm_x100: 12_000, key: Some("H#m"), analysis_path: "/PIONEER/USBANLZ/P001/00000002/ANLZ0000.DAT", length_sec: None })
+        .unwrap();
+    let (analysed, key, length): (i64, String, i64) = f
+        .conn()
+        .query_row("SELECT Analysed, KeyID, Length FROM djmdContent WHERE ID = ?1", [track_id(1)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!((analysed, key.as_str(), length), (105, "12", 300));
+    assert_eq!(f.one::<String>("SELECT AnalysisUpdated FROM djmdContent WHERE ID = ?1", &[&track_id(1)]), "8");
+    assert_eq!(f.one::<i64>("SELECT ContentLink FROM djmdContent WHERE ID = ?1", &[&track_id(1)]), 3_999_246);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdKey"), 1);
+}
+
+#[test]
+fn clearing_the_analysis_puts_the_row_back_to_unanalysed_and_lets_it_be_registered_again() {
+    use rbl_db::write::{AnalysisWrite, ANALYSED_BY_THIS_APP};
+    let mut f = fixture();
+    let stamp = rbl_core::time::now();
+    f.conn()
+        .execute(
+            "INSERT INTO djmdKey (ID, ScaleName, Seq, created_at, updated_at) VALUES ('12', 'Fm', 7, ?1, ?1)",
+            [&stamp],
+        )
+        .unwrap();
+    // The fixture's track is analysed by rekordbox: Analysed 105, a key, a path.
+    f.conn()
+        .execute("UPDATE djmdContent SET Analysed = 105, KeyID = '12', BPM = 12850 WHERE ID = ?1", [track_id(0)])
+        .unwrap();
+    let before: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+
+    let changed = f.writer.clear_analysis(&track_id(0)).unwrap();
+    assert_eq!(changed.rows, 1);
+    assert!(changed.usn > before);
+    let (bpm, key, path, analysed, updated, length): (i64, Option<String>, String, i64, Option<String>, i64) = f
+        .conn()
+        .query_row(
+            "SELECT BPM, KeyID, AnalysisDataPath, Analysed, AnalysisUpdated, Length FROM djmdContent WHERE ID = ?1",
+            [track_id(0)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+    assert_eq!((bpm, key, path.as_str(), analysed, updated), (0, None, "", 0, None));
+    // The file's length is not the analysis's, and stays.
+    assert_eq!(length, 300);
+    let counter: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    assert_eq!(counter, changed.usn);
+
+    // And the point of clearing it: `set_analysis` now writes its own
+    // `Analysed`, where on the 105 above it would have kept rekordbox's.
+    f.writer
+        .set_analysis(
+            &track_id(0),
+            &AnalysisWrite { bpm_x100: 14_000, key: Some("Fm"), analysis_path: "/PIONEER/USBANLZ/P001/0000ABCD/ANLZ0000.DAT", length_sec: None },
+        )
+        .unwrap();
+    let (bpm, analysed): (i64, i64) = f
+        .conn()
+        .query_row("SELECT BPM, Analysed FROM djmdContent WHERE ID = ?1", [track_id(0)], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((bpm, analysed), (14_000, ANALYSED_BY_THIS_APP));
+}
+
+#[test]
+fn a_backup_is_listed_and_can_be_put_back() {
+    use rbl_db::write::{backups_in, restore_backup};
+    let mut f = fixture();
+    let dir = f._dir.path().to_path_buf();
+    let backups = dir.join("backups");
+    assert!(backups_in(&backups).is_empty());
+
+    // Taken on request, before any write.
+    let copy = f.writer.back_up_now().unwrap();
+    assert_eq!(backups_in(&backups), vec![copy.clone()]);
+
+    // A write after it, then the backup put back: the write is gone.
+    let id = f.writer.create_playlist("After the backup", ROOT).unwrap();
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist WHERE Name = 'After the backup'"), 1);
+    let location = f.writer.library().location().clone();
+    // The writer's handle goes; the directory stays.
+    let Fixture { _dir: keep, writer } = f;
+    drop(writer);
+    restore_backup(&location, &copy).unwrap();
+    let db = Library::open(location.clone(), OpenMode::ReadOnly).unwrap();
+    let after: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM djmdPlaylist WHERE ID = ?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "the playlist made after the backup is gone");
+
+    // Only this app's backups are accepted.
+    let stray = dir.join("notes.db");
+    std::fs::write(&stray, b"x").unwrap();
+    assert!(matches!(restore_backup(&location, &stray), Err(DbError::WriteRefused(_))));
+    drop(keep);
+}
+
+#[test]
+fn a_rekordbox_xml_document_is_imported_with_its_playlists_and_cues() {
+    use rbl_db::xml::{self, XmlLibrary};
+    let audio = tempfile::tempdir().unwrap();
+    let one = audio.path().join("One.wav");
+    let two = audio.path().join("Two Ü.wav");
+    write_wav(&one, 2);
+    write_wav(&two, 2);
+    let location = |p: &std::path::Path| {
+        format!("file://localhost{}", p.to_string_lossy().bytes().map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => char::from(b).to_string(),
+            _ => format!("%{b:02X}"),
+        }).collect::<String>())
+    };
+    let doc = format!(
+        r#"<?xml version="1.0"?><DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="3">
+        <TRACK TrackID="1" Name="One" Artist="A" Rating="153" Comments="hi" Location="{}">
+          <POSITION_MARK Name="" Type="0" Start="1.5" Num="-1"/>
+          <POSITION_MARK Name="" Type="0" Start="0.25" Num="0"/>
+          <POSITION_MARK Name="" Type="4" Start="0.5" End="1.0" Num="2"/>
+        </TRACK>
+        <TRACK TrackID="2" Name="Two" Artist="B" Rating="0" Location="{}"/>
+        <TRACK TrackID="3" Name="Gone" Artist="C" Rating="0" Location="file://localhost/nowhere/gone.wav"/>
+        </COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT" Count="1">
+        <NODE Name="Sets" Type="0" Count="1"><NODE Name="Warm up" Type="1" KeyType="0" Entries="3">
+        <TRACK Key="1"/><TRACK Key="2"/><TRACK Key="3"/></NODE></NODE></NODE></PLAYLISTS></DJ_PLAYLISTS>"#,
+        location(&one),
+        location(&two),
+    );
+    let parsed = XmlLibrary::parse(&doc);
+    assert_eq!(parsed.tracks.len(), 3);
+
+    let mut f = fixture();
+    let mut seen = Vec::new();
+    let report = xml::import(&mut f.writer, &parsed, &mut |done, total| seen.push((done, total))).unwrap();
+    assert_eq!((report.imported, report.existing, report.skipped.len(), report.playlists, report.cues), (2, 0, 1, 2, 3));
+    assert_eq!(seen, vec![(1, 3), (2, 3), (3, 3)]);
+    assert!(report.skipped[0].contains("gone.wav"));
+
+    let (rating, comment): (i64, String) = f
+        .conn()
+        .query_row("SELECT Rating, Commnt FROM djmdContent WHERE FolderPath = ?1", [one.to_string_lossy()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((rating, comment.as_str()), (3, "hi"));
+    let kinds: Vec<(i64, i64, i64)> = {
+        let mut stmt = f.conn().prepare("SELECT Kind, InMsec, OutMsec FROM djmdCue WHERE ContentID = (SELECT ID FROM djmdContent WHERE FolderPath = ?1) AND rb_local_deleted = 0 ORDER BY InMsec").unwrap();
+        stmt.query_map([one.to_string_lossy()], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(-1)))).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(kinds, vec![(1, 250, -1), (3, 500, 1000), (0, 1500, -1)]);
+    let folder: String = f.one("SELECT ID FROM djmdPlaylist WHERE Name = 'Sets' AND Attribute = 1", &[]);
+    let playlist_parent: String = f.one("SELECT ParentID FROM djmdPlaylist WHERE Name = 'Warm up'", &[]);
+    assert_eq!(playlist_parent, folder);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongPlaylist WHERE rb_local_deleted = 0 AND PlaylistID = (SELECT ID FROM djmdPlaylist WHERE Name = 'Warm up')"), 2);
+
+    // Importing again reuses the tracks and doubles no cues.
+    let again = xml::import(&mut f.writer, &parsed, &mut |_, _| {}).unwrap();
+    assert_eq!((again.imported, again.existing, again.cues), (0, 2, 0));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdContent WHERE rb_local_deleted = 0 AND FolderPath LIKE '%One.wav'"), 1);
+}
+
+#[test]
+fn a_bpm_typed_over_retimes_the_grid_and_sets_the_column() {
+    let mut f = fixture();
+    let location = f.writer.library().location().clone();
+    // A DAT with a 120 BPM grid of eight beats, and a stale PQT2 beside it.
+    let beats: Vec<rbl_anlz::Beat> = (0..8)
+        .map(|i| rbl_anlz::Beat { beat_number: (i % 4) + 1, tempo_x100: 12_000, time_ms: 250 + u32::from(i) * 500 })
+        .collect();
+    let mut builder = rbl_anlz::AnlzBuilder::new();
+    builder.path("/m/x.mp3").beat_grid(&beats).raw(rbl_core::FourCc::new(b"PQT2"), vec![0; 32], vec![0; 16]);
+    let relative = "/PIONEER/USBANLZ/P001/00000001/ANLZ0000.DAT";
+    let dat = location.share_root.join(relative.trim_start_matches('/'));
+    std::fs::create_dir_all(dat.parent().unwrap()).unwrap();
+    std::fs::write(&dat, builder.finish()).unwrap();
+    fixture::set_analysis_path(&location, 0, relative).unwrap();
+
+    f.writer.set_field(&track_id(0), TrackField::Bpm, "128.5").unwrap();
+    let bpm: i64 = f.one("SELECT BPM FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_eq!(bpm, 12_850);
+    let next: String = f.one("SELECT AnalysisDataPath FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_ne!(next, relative);
+    assert_eq!(rbl_anlz::Anlz::read(&dat).unwrap().beat_grid().unwrap(), beats);
+    let rewritten = rbl_anlz::Anlz::read(&rbl_anlz::resolve(&location.share_root, &next)).unwrap();
+    let grid = rewritten.beat_grid().unwrap();
+    assert_eq!(grid.len(), 8);
+    assert_eq!(grid[0].time_ms, 250, "the first beat stays where it was");
+    assert_eq!(grid[1].time_ms, 250 + 467, "60000 / 128.5 is 466.9 ms");
+    assert_eq!(grid[7].time_ms, 250 + (7.0_f64 * 6_000_000.0 / 12_850.0).round() as u32);
+    assert!(grid.iter().all(|b| b.tempo_x100 == 12_850));
+    assert_eq!(grid.iter().map(|b| b.beat_number).collect::<Vec<_>>(), vec![1, 2, 3, 4, 1, 2, 3, 4]);
+    assert!(!rewritten.has_extended_grid(), "the stale PQT2 is dropped");
+    assert_eq!(rewritten.path().as_deref(), Some("/m/x.mp3"), "the rest of the file is kept");
+
+    // Nonsense and the impossible are refused before anything is touched.
+    assert!(matches!(f.writer.set_field(&track_id(0), TrackField::Bpm, "fast"), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.set_field(&track_id(0), TrackField::Bpm, "1200"), Err(DbError::WriteRefused(_))));
+    // A track with no analysis only gets the column.
+    f.writer.set_field(&track_id(1), TrackField::Bpm, "90").unwrap();
+    let plain: i64 = f.one("SELECT BPM FROM djmdContent WHERE ID = ?1", &[&track_id(1)]);
+    assert_eq!(plain, 9_000);
+}
+
+#[test]
+fn artwork_is_filed_in_the_share_tree_and_cleared_to_empty() {
+    let mut f = fixture();
+    let location = f.writer.library().location().clone();
+    let image = f._dir.path().join("cover.png");
+    std::fs::write(&image, b"\x89PNG not really").unwrap();
+
+    f.writer.set_artwork(&track_id(0), Some(&image)).unwrap();
+    let path: String = f.one("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert!(path.starts_with("/PIONEER/Artwork/") && path.ends_with("/artwork.png"), "{path}");
+    let parts: Vec<&str> = path.split('/').collect();
+    assert_eq!(parts.len(), 6, "{path}");
+    assert_eq!(parts[3], &parts[4][..3], "the bucket is the uuid's first three characters");
+    let filed = location.share_root.join(path.trim_start_matches('/'));
+    assert_eq!(std::fs::read(&filed).unwrap(), b"\x89PNG not really");
+
+    assert!(matches!(f.writer.set_artwork(&track_id(0), Some(&f._dir.path().join("x.txt"))), Err(DbError::WriteRefused(_))));
+
+    f.writer.set_artwork(&track_id(0), None).unwrap();
+    let cleared: String = f.one("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert_eq!(cleared, "");
+    assert!(filed.is_file(), "the file stays where it is");
+    // Not a picture, so no small sizes beside it.
+    assert!(!filed.with_file_name("artwork_s.jpg").exists());
+
+    // A real picture gets the two sizes a stick takes: 240 and 80 square,
+    // cut from the middle of a picture that is not.
+    let real = f._dir.path().join("wide.png");
+    let wide = image::RgbImage::from_fn(300, 100, |x, _| image::Rgb([u8::try_from(x % 256).unwrap_or(0), 0, 0]));
+    wide.save(&real).unwrap();
+    f.writer.set_artwork(&track_id(1), Some(&real)).unwrap();
+    let path: String = f.one("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&track_id(1)]);
+    let filed = location.share_root.join(path.trim_start_matches('/'));
+    for (name, side) in [("artwork_m.jpg", 240), ("artwork_s.jpg", 80)] {
+        let small = image::open(filed.with_file_name(name)).unwrap();
+        assert_eq!((small.width(), small.height()), (side, side), "{name}");
+    }
+
+    // A playlist takes a picture the same way.
+    f.writer.set_playlist_artwork(&playlist_id(1), Some(&real)).unwrap();
+    let path: String = f.one("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&playlist_id(1)]);
+    assert!(path.starts_with("/PIONEER/Artwork/") && path.ends_with("/artwork.png"), "{path}");
+    f.writer.set_playlist_artwork(&playlist_id(1), None).unwrap();
+    let cleared: String = f.one("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&playlist_id(1)]);
+    assert_eq!(cleared, "");
+}
+
+#[test]
+fn a_play_goes_on_todays_session_and_can_be_taken_off_again() {
+    let mut f = fixture();
+    let today = rbl_core::time::local_date();
+    f.writer.record_play(&track_id(3)).unwrap();
+    f.writer.record_play(&track_id(4)).unwrap();
+    f.writer.record_play(&track_id(3)).unwrap();
+
+    let session: String = f.one(
+        "SELECT ID FROM djmdHistory WHERE Name = ?1 AND Attribute = 0 AND rb_local_deleted = 0",
+        &[&format!("HISTORY {today}")],
+    );
+    let (month_id, created): (String, String) = f
+        .conn()
+        .query_row("SELECT ParentID, DateCreated FROM djmdHistory WHERE ID = ?1", [&session], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert!(created.starts_with(&today) && created.len() == 19, "{created}");
+    let (month_name, year_id): (String, String) = f
+        .conn()
+        .query_row("SELECT Name, ParentID FROM djmdHistory WHERE ID = ?1 AND Attribute = 1", [&month_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    let year_name: String = f.one("SELECT Name FROM djmdHistory WHERE ID = ?1 AND Attribute = 1 AND ParentID = 'root'", &[&year_id]);
+    assert_eq!(year_name, &today[..4]);
+    assert_eq!(month_name, today[5..7].trim_start_matches('0'));
+    // A year already there is reused: the fixture's 2026 folder, when today is in it.
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdHistory WHERE Attribute = 1 AND ParentID = 'root' AND rb_local_deleted = 0"), if today.starts_with("2026") { 1 } else { 2 });
+
+    let plays: Vec<(String, i64)> = {
+        let mut stmt = f.conn().prepare("SELECT ContentID, TrackNo FROM djmdSongHistory WHERE HistoryID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo").unwrap();
+        stmt.query_map([&session], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(plays, vec![(track_id(3), 1), (track_id(4), 2), (track_id(3), 3)]);
+    let count: i64 = f.one("SELECT DJPlayCount FROM djmdContent WHERE ID = ?1", &[&track_id(3)]);
+    assert_eq!(count, 2);
+
+    let changed = f.writer.remove_from_history(&session, &[track_id(3)]).unwrap();
+    assert_eq!(changed.rows, 2);
+    let left: Vec<(String, i64)> = {
+        let mut stmt = f.conn().prepare("SELECT ContentID, TrackNo FROM djmdSongHistory WHERE HistoryID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo").unwrap();
+        stmt.query_map([&session], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(left, vec![(track_id(4), 1)], "the gap closes");
+    assert!(matches!(f.writer.record_play("no-such-track"), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn my_tags_are_set_as_a_whole_and_read_back_on_the_details() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    let id = track_id(2);
+    f.writer.set_my_tags(&id, &[MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]).unwrap();
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    assert_eq!(read.my_tags, vec![MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]);
+
+    f.writer.set_my_tags(&track_id(3), &[MY_TAG_PEAK.to_owned()]).unwrap();
+    let second: i64 = f.one(
+        "SELECT TrackNo FROM djmdSongMyTag WHERE MyTagID = ?1 AND ContentID = ?2 AND rb_local_deleted = 0",
+        &[&MY_TAG_PEAK, &track_id(3)],
+    );
+    assert_eq!(second, 2, "each tag's list numbers on");
+
+    // Taking one off soft-deletes it and leaves the other row untouched.
+    let changed = f.writer.set_my_tags(&id, &[MY_TAG_WARM_UP.to_owned()]).unwrap();
+    assert_eq!(changed.rows, 1);
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    assert_eq!(read.my_tags, vec![MY_TAG_WARM_UP.to_owned()]);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongMyTag WHERE rb_local_deleted = 1"), 1);
+
+    assert!(matches!(f.writer.set_my_tags(&id, &["nope".to_owned()]), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.set_my_tags("no-track", &[]), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn the_tag_list_takes_tracks_on_the_end_and_closes_up_when_one_comes_off() {
+    let mut f = fixture();
+    let changed = f.writer.tag_list_add(&[track_id(3), track_id(1), track_id(3)]).unwrap();
+    assert_eq!(changed.rows, 2, "a track already on the list is not added again");
+    let counter_before: i64 =
+        f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    // Numbered on from 1, with no update counter of their own, as rekordbox
+    // writes them.
+    let order = |f: &mut Fixture| -> Vec<(String, i64)> {
+        let conn = f.conn();
+        let mut stmt = conn
+            .prepare("SELECT ContentID, TrackNo FROM djmdSongTagList WHERE rb_local_deleted = 0 ORDER BY TrackNo")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert_eq!(order(&mut f), vec![(track_id(3), 1), (track_id(1), 2)]);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongTagList WHERE usn IS NULL AND rb_local_usn IS NULL"), 2);
+
+    f.writer.tag_list_add(&[track_id(2)]).unwrap();
+    f.writer.tag_list_remove(&[track_id(3)]).unwrap();
+    assert_eq!(order(&mut f), vec![(track_id(1), 1), (track_id(2), 2)], "the gap closes");
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongTagList WHERE rb_local_deleted = 1"), 1);
+    let counter_after: i64 =
+        f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    assert_eq!(counter_before, counter_after, "the tag list does not move the update counter");
+
+    f.writer.tag_list_clear().unwrap();
+    assert!(order(&mut f).is_empty());
+    assert!(matches!(f.writer.tag_list_add(&["no-such-track".to_owned()]), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn reload_tag_reads_the_file_again_over_the_row() {
+    use lofty::config::WriteOptions;
+    use lofty::prelude::{ItemKey, TagExt};
+    use lofty::tag::{Tag, TagType};
+
+    let audio = tempfile::tempdir().unwrap();
+    let path = audio.path().join("Tagged.wav");
+    write_wav(&path, 1);
+    let mut f = fixture();
+    let id = f.writer.import_file(&path).unwrap();
+    let title: String = f.one("SELECT Title FROM djmdContent WHERE ID = ?1", &[&id]);
+    assert_eq!(title, "Tagged", "no tag, so the file's name");
+
+    // The file gains tags after the import; Reload Tag brings them in.
+    let mut tag = Tag::new(TagType::RiffInfo);
+    tag.insert_text(ItemKey::TrackTitle, "Retitled".to_owned());
+    tag.insert_text(ItemKey::TrackArtist, "Someone".to_owned());
+    tag.insert_text(ItemKey::Genre, "House".to_owned());
+    tag.insert_text(ItemKey::Comment, "a note".to_owned());
+    tag.insert_text(ItemKey::TrackNumber, "7".to_owned());
+    tag.save_to_path(&path, WriteOptions::default()).unwrap();
+    let changed = f.writer.reload_tags(&id).unwrap();
+    assert!(changed >= 4, "{changed}");
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    assert_eq!((read.title.as_str(), read.artist.as_str(), read.genre.as_str()), ("Retitled", "Someone", "House"));
+    assert_eq!((read.comment.as_str(), read.track_number), ("a note", 7));
+    assert!(matches!(f.writer.reload_tags("no-such-track"), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn embedded_cover_is_registered_with_thumbnails_and_never_replaces_custom_art() {
+    use lofty::config::WriteOptions;
+    use lofty::picture::{MimeType, Picture, PictureType};
+    use lofty::prelude::TagExt;
+    use lofty::tag::{Tag, TagType};
+
+    let mut f = fixture();
+    let path = f._dir.path().join("cover.wav");
+    write_wav(&path, 1);
+    let id = f.writer.import_file(&path).unwrap();
+    assert!(!f.writer.import_artwork(&id).unwrap(), "untagged audio has no cover");
+    let png = f._dir.path().join("front.png");
+    image::RgbImage::from_pixel(12, 8, image::Rgb([10, 100, 200])).save(&png).unwrap();
+    let bytes = std::fs::read(&png).unwrap();
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.push_picture(Picture::new_unchecked(PictureType::CoverFront, Some(MimeType::Png), None, bytes.clone()));
+    tag.save_to_path(&path, WriteOptions::default()).unwrap();
+    assert!(f.writer.import_artwork(&id).unwrap());
+    let relative: String = f.one("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&id]);
+    let filed = rbl_anlz::resolve(&f.writer.library().location().share_root, &relative);
+    assert_eq!(std::fs::read(&filed).unwrap(), bytes);
+    for (name, size) in [("artwork_s.jpg", 80), ("artwork_m.jpg", 240)] {
+        let thumb = image::open(filed.with_file_name(name)).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (size, size));
+    }
+    assert!(!f.writer.import_artwork(&id).unwrap(), "repeat analysis keeps the existing cover");
+    f.writer.set_artwork(&id, Some(&png)).unwrap();
+    let custom: String = f.one("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&id]);
+    assert!(!f.writer.import_artwork(&id).unwrap());
+    assert_eq!(f.one::<String>("SELECT ImagePath FROM djmdContent WHERE ID = ?1", &[&id]), custom);
+}
+
+#[test]
+fn usb_cues_replace_old_cues_and_preserve_loop_details() {
+    let mut f = fixture();
+    let track = track_id(0).to_string();
+    f.writer.add_cue(&track, 1, 100).unwrap();
+    let cue = rbl_anlz::CueEntry { hot_cue: 4, kind: 2, time_ms: 1000, loop_time_ms: 5000, color_id: 0, comment: Some("USB loop".into()), color_code: Some(21), rgb: None };
+    f.writer.import_usb_cues(&track, &[cue], 12800).unwrap();
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue WHERE rb_local_deleted=0"), 1);
+    let values: (i64, i64, String) = f.conn().query_row("SELECT Kind, OutMsec, Comment FROM djmdCue WHERE rb_local_deleted=0", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(values, (5, 5000, "USB loop".into()));
+    assert_eq!(f.one::<i64>("SELECT BPM FROM djmdContent WHERE ID=?1", &[&track]), 12800);
+}
+
+#[test]
+fn usb_history_is_repeat_safe_and_appends_new_plays() {
+    let mut f = fixture();
+    let track = track_id(0).to_string();
+    let uuid = "00000000-0000-4000-8000-000000000001";
+    assert_eq!(f.writer.import_usb_history("USB session", uuid, &[track.clone(), track.clone()]).unwrap(), 2);
+    assert_eq!(f.writer.import_usb_history("USB session", uuid, &[track.clone(), track.clone()]).unwrap(), 0);
+    assert_eq!(f.writer.import_usb_history("USB session", uuid, &[track.clone(), track.clone(), track]).unwrap(), 1);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongHistory WHERE rb_local_deleted=0 AND HistoryID IN (SELECT ID FROM djmdHistory WHERE UUID='00000000-0000-4000-8000-000000000001')"), 3);
+}
+
+#[test]
+fn relocation_rolls_back_both_columns_when_the_counter_write_fails() {
+    let mut f = fixture();
+    let before: (String, String) = f.conn().query_row("SELECT FolderPath, FileNameL FROM djmdContent WHERE ID=?1", [track_id(0)], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let path = f._dir.path().join("moved.wav");
+    std::fs::write(&path, b"audio").unwrap();
+    f.conn().execute_batch("CREATE TRIGGER fail_counter BEFORE UPDATE ON agentRegistry BEGIN SELECT RAISE(ABORT, 'injected failure'); END").unwrap();
+    assert!(f.writer.relocate(&track_id(0), &path).is_err());
+    let after: (String, String) = f.conn().query_row("SELECT FolderPath, FileNameL FROM djmdContent WHERE ID=?1", [track_id(0)], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn reload_tags_rolls_back_earlier_fields_and_new_lookup_rows() {
+    use lofty::{config::WriteOptions, prelude::{ItemKey, TagExt}, tag::{Tag, TagType}};
+    let mut f = fixture();
+    let path = f._dir.path().join("tags.wav");
+    write_wav(&path, 1);
+    let id = f.writer.import_file(&path).unwrap();
+    let counter: i64 = f.one("SELECT int_1 FROM agentRegistry WHERE registry_id='localUpdateCount'", &[]);
+    let mut tags = Tag::new(TagType::RiffInfo);
+    tags.insert_text(ItemKey::TrackTitle, "Changed".into());
+    tags.insert_text(ItemKey::TrackArtist, "New rollback artist".into());
+    tags.save_to_path(&path, WriteOptions::default()).unwrap();
+    f.conn().execute_batch("CREATE TRIGGER fail_artist BEFORE UPDATE OF ArtistID ON djmdContent BEGIN SELECT RAISE(ABORT, 'injected failure'); END").unwrap();
+    assert!(f.writer.reload_tags(&id).is_err());
+    assert_eq!(f.one::<String>("SELECT Title FROM djmdContent WHERE ID=?1", &[&id]), "tags");
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdArtist WHERE Name='New rollback artist'"), 0);
+    assert_eq!(f.one::<i64>("SELECT int_1 FROM agentRegistry WHERE registry_id='localUpdateCount'", &[]), counter);
+}
+
+#[test]
+fn bpm_failure_keeps_the_old_grid_and_database_reference() {
+    let mut f = fixture();
+    let location = f.writer.library().location().clone();
+    let relative = "/PIONEER/USBANLZ/test/ANLZ0000.DAT";
+    let dat = rbl_anlz::resolve(&location.share_root, relative);
+    std::fs::create_dir_all(dat.parent().unwrap()).unwrap();
+    let mut builder = rbl_anlz::AnlzBuilder::new();
+    builder.beat_grid(&[rbl_anlz::Beat { beat_number: 1, tempo_x100: 12000, time_ms: 0 }]);
+    let before = builder.finish();
+    std::fs::write(&dat, &before).unwrap();
+    fixture::set_analysis_path(&location, 0, relative).unwrap();
+    let bpm: i64 = f.one("SELECT BPM FROM djmdContent WHERE ID=?1", &[&track_id(0)]);
+    f.conn().execute_batch("CREATE TRIGGER fail_bpm BEFORE UPDATE OF BPM ON djmdContent BEGIN SELECT RAISE(ABORT, 'injected failure'); END").unwrap();
+    assert!(f.writer.set_bpm(&track_id(0), "130").is_err());
+    assert_eq!(std::fs::read(dat).unwrap(), before);
+    assert_eq!(f.one::<String>("SELECT AnalysisDataPath FROM djmdContent WHERE ID=?1", &[&track_id(0)]), relative);
+    assert_eq!(f.one::<i64>("SELECT BPM FROM djmdContent WHERE ID=?1", &[&track_id(0)]), bpm);
+}
+
+#[test]
+fn writable_connections_require_durable_commits() {
+    let f = fixture();
+    assert_eq!(f.one::<i64>("PRAGMA synchronous", &[]), 3);
+    assert_eq!(f.one::<i64>("PRAGMA fullfsync", &[]), 1);
+    assert_eq!(f.one::<i64>("PRAGMA read_uncommitted", &[]), 0);
+}
+
+// Spawned by abrupt_process_exit_recovers_without_partial_rows. exit() skips
+// Rust Drop, including Transaction's rollback and Connection's clean close.
+#[test]
+fn crash_writer_child() {
+    let Some(root) = std::env::var_os("RBL_CRASH_TEST_ROOT") else { return; };
+    let root = std::path::PathBuf::from(root);
+    let location = rbl_db::LibraryLocation { master_db: root.join("master.db"), share_root: root.join("share"), passphrase: fixture::FIXTURE_PASSPHRASE.into(), is_real_install: false };
+    let mut db = Library::open(location, OpenMode::ReadWrite).unwrap();
+    db.connection().pragma_update(None, "cache_size", 1).unwrap();
+    let tx = db.connection_mut().transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    tx.execute("UPDATE djmdContent SET Rating=5, rb_local_usn=99999 WHERE ID=?1", [track_id(0)]).unwrap();
+    tx.execute("UPDATE djmdContent SET Commnt=printf('%16384s', 'crash test')", []).unwrap();
+    if std::env::var_os("RBL_CRASH_TEST_COMMIT").is_some() {
+        tx.execute("UPDATE agentRegistry SET int_1=99999 WHERE registry_id='localUpdateCount'", []).unwrap();
+        tx.commit().unwrap();
+    }
+    std::process::exit(91);
+}
+
+#[test]
+fn abrupt_process_exit_recovers_without_partial_rows() {
+    for mode in ["DELETE", "WAL"] {
+        for commit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let location = fixture::build(dir.path(), Shape::default()).unwrap();
+            let db = Library::open(location.clone(), OpenMode::ReadWrite).unwrap();
+            db.connection().pragma_update(None, "journal_mode", mode).unwrap();
+            let before: i64 = db.connection().query_row("SELECT Rating FROM djmdContent WHERE ID=?1", [track_id(0)], |r| r.get(0)).unwrap();
+            drop(db);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "crash_writer_child", "--nocapture"]).env("RBL_CRASH_TEST_ROOT", dir.path());
+            child.env_remove("RBL_CRASH_TEST_COMMIT");
+            if commit { child.env("RBL_CRASH_TEST_COMMIT", "1"); }
+            assert_eq!(child.output().unwrap().status.code(), Some(91));
+            let db = Library::open(location, OpenMode::ReadOnly).unwrap();
+            let rating: i64 = db.connection().query_row("SELECT Rating FROM djmdContent WHERE ID=?1", [track_id(0)], |r| r.get(0)).unwrap();
+            let counter: i64 = db.connection().query_row("SELECT int_1 FROM agentRegistry WHERE registry_id='localUpdateCount'", [], |r| r.get(0)).unwrap();
+            let integrity: String = db.connection().query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+            assert_eq!(rating, if commit { 5 } else { before });
+            assert_eq!(counter, if commit { 99999 } else { Shape::default().start_usn });
+            assert_eq!(integrity, "ok");
+        }
+    }
+}
+
+#[test]
+fn backup_is_standalone_and_includes_committed_wal_pages() {
+    let mut f = fixture();
+    f.conn().execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    f.conn().execute("UPDATE djmdContent SET Rating=5 WHERE ID=?1", [track_id(0)]).unwrap();
+    let backup = f.writer.back_up_now().unwrap();
+    assert!(!std::path::PathBuf::from(format!("{}-wal", backup.display())).exists());
+    let mut location = f.writer.library().location().clone();
+    location.master_db = backup;
+    let db = Library::open(location, OpenMode::ReadOnly).unwrap();
+    let rating: i64 = db.connection().query_row("SELECT Rating FROM djmdContent WHERE ID=?1", [track_id(0)], |r| r.get(0)).unwrap();
+    assert_eq!(rating, 5);
+    assert_eq!(db.connection().query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+}
+
+#[test]
+fn invalid_backup_preserves_live_database_and_wal() {
+    let f = fixture();
+    f.conn().execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    f.conn().execute("UPDATE djmdContent SET Rating=4 WHERE ID=?1", [track_id(0)]).unwrap();
+    let backup = f._dir.path().join("master-corrupt.db");
+    std::fs::write(&backup, b"not a database").unwrap();
+    let location = f.writer.library().location();
+    let wal = std::path::PathBuf::from(format!("{}-wal", location.master_db.display()));
+    let before = std::fs::read(&wal).unwrap();
+    assert!(rbl_db::write::restore_backup(location, &backup).is_err());
+    assert_eq!(std::fs::read(wal).unwrap(), before);
+    assert_eq!(f.one::<i64>("SELECT Rating FROM djmdContent WHERE ID=?1", &[&track_id(0)]), 4);
+}
+
+#[test]
+fn grid_lock_preserves_other_flags_and_grid_revision_uses_reference_character() {
+    let mut f = fixture();
+    let id = track_id(1);
+    f.conn().execute("UPDATE djmdContent SET Analysed=53, AnalysisUpdated='9' WHERE ID=?1", [&id]).unwrap();
+    f.writer.set_analysis_lock(&id,true).unwrap();
+    assert_eq!(f.one::<i64>("SELECT Analysed FROM djmdContent WHERE ID=?1", &[&id]),181);
+    f.writer.set_analysis_lock(&id,false).unwrap();
+    assert_eq!(f.one::<i64>("SELECT Analysed FROM djmdContent WHERE ID=?1", &[&id]),53);
+    f.writer.save_grid_revision(&id,12800).unwrap();
+    assert_eq!(f.one::<String>("SELECT AnalysisUpdated FROM djmdContent WHERE ID=?1", &[&id]),":");
+    assert_eq!(f.one::<i64>("SELECT BPM FROM djmdContent WHERE ID=?1", &[&id]),12800);
+}
