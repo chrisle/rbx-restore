@@ -18,9 +18,7 @@ fs.writeFileSync(tauriConfigPath, `${JSON.stringify(tauriConfig, null, 2)}\n`);
 
 const cargoPath = "Cargo.toml";
 const cargo = fs.readFileSync(cargoPath, "utf8");
-const updatedCargo = cargo.replace(
-  /(\[workspace\.package\][\s\S]*?\nversion\s*=\s*)"[^"]+"/,
-  `$1"${version}"`,
-);
-if (updatedCargo === cargo) throw new Error("Cargo workspace version was not found");
+const workspaceVersion = /(\[workspace\.package\][\s\S]*?\nversion\s*=\s*)"[^"]+"/;
+if (!workspaceVersion.test(cargo)) throw new Error("Cargo workspace version was not found");
+const updatedCargo = cargo.replace(workspaceVersion, `$1"${version}"`);
 fs.writeFileSync(cargoPath, updatedCargo);
