@@ -118,6 +118,10 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # See the same step in build-installer.yml.
+      - name: Give cargo a home of its own
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

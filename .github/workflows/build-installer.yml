@@ -73,6 +73,12 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # ~/.cargo is shared by every job on the host, and rust-cache deletes its
+      # registry sources when a job ends; keep this job's registry to itself.
+      - name: Give cargo a home of its own
+        if: runner.os != 'Windows'
+        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
       - name: Ensure rustup
         if: runner.os == 'Windows'
         shell: pwsh
