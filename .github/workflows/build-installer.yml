@@ -329,8 +329,11 @@ jobs:
         run: |
           $installer = @(Get-ChildItem out\*-setup.exe)
           if ($installer.Count -ne 1) { throw "Expected one installer, found $($installer.Count)." }
-          $app = Join-Path $env:CARGO_TARGET_DIR "${{ inputs.target }}/release/rbxport-restore.exe"
-          $files = @($app, $installer[0].FullName)
+          # Tauri patches and signs the app executable before embedding it in
+          # NSIS, then restores the original build output after packaging. The
+          # executable left in target/release is therefore not the shipped,
+          # signed copy and must not be used as a post-build verification target.
+          $files = @($installer[0].FullName)
           $windowsKits = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
           $signtool = Get-ChildItem -LiteralPath $windowsKits -Filter signtool.exe -Recurse -File |
             Where-Object { $_.Directory.Name -eq "x64" } |
