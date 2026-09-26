@@ -212,7 +212,6 @@ jobs:
           KEYCHAIN="$RUNNER_TEMP/rbxport-restore-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
           echo "::add-mask::$KEYCHAIN_PASSWORD"
-          security list-keychains -d user | sed 's/^ *"//;s/"$//' > "$RUNNER_TEMP/keychains.before"
           security delete-keychain "$KEYCHAIN" 2>/dev/null || true
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
@@ -224,8 +223,15 @@ jobs:
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
-          # shellcheck disable=SC2046
-          security list-keychains -d user -s "$KEYCHAIN" $(cat "$RUNNER_TEMP/keychains.before")
+          # The search list is shared with other repositories' signing jobs on
+          # this Mac: edit it as it stands now and touch only this job's entry.
+          # Entries whose file is gone are dropped.
+          others="$(security list-keychains -d user | sed 's/^ *"//;s/"$//' |
+            while IFS= read -r k; do
+              if [ -f "$k" ] && [ "$k" != "$KEYCHAIN" ]; then printf '%s\n' "$k"; fi
+            done)"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KEYCHAIN" $others
           security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Clear prior bundle artifacts
@@ -359,10 +365,11 @@ jobs:
         shell: bash
         run: |
           KEYCHAIN="$RUNNER_TEMP/rbxport-restore-signing.keychain-db"
-          if [ -f "$RUNNER_TEMP/keychains.before" ]; then
-            # shellcheck disable=SC2046
-            security list-keychains -d user -s $(cat "$RUNNER_TEMP/keychains.before") || true
-          fi
+          # Remove only this job's entry; restoring a snapshot would also drop
+          # keychains other jobs added since.
+          others="$(security list-keychains -d user | sed 's/^ *"//;s/"$//' | grep -vxF "$KEYCHAIN" || true)"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s $others || true
           security delete-keychain "$KEYCHAIN" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/cert.p12"
 
